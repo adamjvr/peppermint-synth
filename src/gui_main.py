@@ -7,12 +7,15 @@ SynthControlWindow (PyQt6)
 
 Main front-panel GUI for the SuperCollider-based synth.
 
-This version makes ALL continuous parameters (VCO, Filter, LFO, ENV, AMP)
-use the exact same "ParameterSlider" widget, so they share:
+This version:
+- Uses a reusable ParameterSlider widget for ALL continuous parameters.
+- Arranges the main synth controls as stacked banks:
 
-- Vertical ARP-style fader look.
-- Label + current numeric value.
-- Colored handle on white background.
+    VCO  : sliders side-by-side, full travel
+    FILTER: sliders side-by-side, full travel, below VCO
+    LFO  : sliders side-by-side, full travel
+    ENV  : sliders side-by-side, full travel, bank centered
+    AMP  : single Level slider, centered
 
 Also includes:
 - Mono / Poly selector
@@ -45,14 +48,13 @@ class ParameterSlider(QtWidgets.QWidget):
         [Label + current value]
         [   vertical slider    ]
 
-    - `param_name` is the SynthDef control name (e.g. "cutoff").
-    - `min_val` / `max_val` define the numeric range.
-    - `default` is the initial value.
-    - `color` controls the handle color.
+    - param_name: SynthDef control name (e.g. "cutoff").
+    - min_val / max_val: numeric range.
+    - default: initial value.
+    - color: fader handle color.
 
-    The enclosing SynthControlWindow will:
-      - read/write the slider value via methods
-      - forward changes to the SuperColliderSynthController.
+    Emits:
+        valueChanged(str param_name, float value)
     """
 
     valueChanged = QtCore.pyqtSignal(str, float)  # (param_name, value)
@@ -78,7 +80,7 @@ class ParameterSlider(QtWidgets.QWidget):
         layout.setSpacing(2)
         self.setLayout(layout)
 
-        # Label shows "name + current value"
+        # Label shows: base text + current numeric value
         self.label = QtWidgets.QLabel()
         self.label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
         self.label.setStyleSheet("color: black;")
@@ -86,11 +88,11 @@ class ParameterSlider(QtWidgets.QWidget):
         font.setPointSize(9)
         self.label.setFont(font)
 
-        # Vertical slider
+        # Vertical slider with full travel
         self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
         self.slider.setRange(0, 1000)
+        self.slider.setMinimumHeight(140)  # ensure nice travel
 
-        # Style: ARP-style colored handle on grey track
         self.slider.setStyleSheet(f"""
             QSlider::groove:vertical {{
                 background: #e0e0e0;
@@ -110,10 +112,9 @@ class ParameterSlider(QtWidgets.QWidget):
         layout.addWidget(self.label)
         layout.addWidget(self.slider, 1, QtCore.Qt.AlignmentFlag.AlignHCenter)
 
-        # store for label updates
         self._base_label_text = label_text
 
-        # Init value
+        # Initialize value
         self.set_value(default, emit=False)
 
         self.slider.valueChanged.connect(self._on_slider_changed)
@@ -139,8 +140,7 @@ class ParameterSlider(QtWidgets.QWidget):
         """
         Set the parameter value and update slider + label.
 
-        If emit=False, the valueChanged signal is not emitted (useful
-        when restoring a preset without re-triggering logic).
+        If emit=False, the valueChanged signal is not emitted.
         """
         slider_pos = self._value_to_slider(value)
         self.slider.blockSignals(True)
@@ -178,10 +178,10 @@ class SynthControlWindow(QtWidgets.QWidget):
     - MidiInputManager              (hardware / virtual MIDI in)
     - SynthPresetManager            (JSON presets)
 
-    Composed of:
-    - ParameterSlider widgets for all continuous controls
-    - Combo boxes/buttons for mode, LFO target, note, MIDI port
-    - PianoWidget for on-screen keyboard
+    UI:
+    - Top rows: Mode/LFO target/Note + MIDI + presets
+    - Middle: stacked banks of ParameterSliders
+    - Bottom: Piano keyboard
     """
 
     def __init__(self, sc_controller: SuperColliderSynthController, parent=None):
@@ -189,18 +189,17 @@ class SynthControlWindow(QtWidgets.QWidget):
 
         self.sc = sc_controller
 
-        # Explicitly set white bg + black text so labels always visible
+        # Make sure labels are visible regardless of system theme
         self.setWindowTitle("PyQt6 SuperCollider Synth – ARP-style GUI")
         self.setStyleSheet("background-color: white; color: black;")
 
-        # Param sliders by name
+        # All continuous parameters -> ParameterSlider
         self.param_sliders: Dict[str, ParameterSlider] = {}
 
         # MIDI + presets
         self.midi_manager: MidiInputManager | None = None
         self.preset_manager = SynthPresetManager()
 
-        # Build full UI and attach MIDI
         self._build_ui()
         self._setup_midi()
 
@@ -215,7 +214,7 @@ class SynthControlWindow(QtWidgets.QWidget):
         self.setLayout(main_layout)
 
         # ------------------------------
-        # Row 1: mode / LFO target / note / Note On/Off
+        # Row 1: mode / LFO target / note / Note On-Off
         # ------------------------------
         top_layout = QtWidgets.QHBoxLayout()
 
@@ -243,7 +242,6 @@ class SynthControlWindow(QtWidgets.QWidget):
         note_lbl.setStyleSheet("color: black;")
 
         self.note_combo = QtWidgets.QComboBox()
-        # store MIDI notes in .currentData()
         self.note_combo.addItem("A2 (110 Hz)", 45)
         self.note_combo.addItem("A3 (220 Hz)", 57)
         self.note_combo.addItem("A4 (440 Hz)", 69)
@@ -297,26 +295,43 @@ class SynthControlWindow(QtWidgets.QWidget):
         main_layout.addLayout(second_layout)
 
         # ------------------------------
-        # Row 3: vertical slider columns
+        # Middle: stacked banks of sliders
         # ------------------------------
-        panel_layout = QtWidgets.QHBoxLayout()
-        panel_layout.setSpacing(25)
-        main_layout.addLayout(panel_layout)
+        banks_layout = QtWidgets.QVBoxLayout()
+        banks_layout.setSpacing(15)
+        main_layout.addLayout(banks_layout)
 
-        def add_param_slider_column(title: str) -> QtWidgets.QVBoxLayout:
+        def create_bank(title: str, center: bool = False):
             """
-            Utility: create a column with a bold header for a group
-            of ParameterSlider widgets.
+            Create a bank (header + horizontal row of sliders).
+
+            Returns:
+                (bank_layout, sliders_row_layout)
             """
-            col = QtWidgets.QVBoxLayout()
+            bank_layout = QtWidgets.QVBoxLayout()
+            bank_layout.setSpacing(4)
+
             header = QtWidgets.QLabel(title)
             header.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
             header.setStyleSheet("font-weight: bold; color: black;")
-            col.addWidget(header)
-            return col
+            bank_layout.addWidget(header)
+
+            sliders_row = QtWidgets.QHBoxLayout()
+            sliders_row.setSpacing(10)
+
+            if center:
+                wrapper = QtWidgets.QHBoxLayout()
+                wrapper.addStretch(1)
+                wrapper.addLayout(sliders_row)
+                wrapper.addStretch(1)
+                bank_layout.addLayout(wrapper)
+            else:
+                bank_layout.addLayout(sliders_row)
+
+            return bank_layout, sliders_row
 
         def add_param_slider(
-            col_layout: QtWidgets.QVBoxLayout,
+            row_layout: QtWidgets.QHBoxLayout,
             label_text: str,
             param_name: str,
             min_val: float,
@@ -334,60 +349,60 @@ class SynthControlWindow(QtWidgets.QWidget):
             )
             slider.valueChanged.connect(self._handle_param_slider_changed)
             self.param_sliders[param_name] = slider
-            col_layout.addWidget(slider, 1)
+            row_layout.addWidget(slider)
 
-        # VCO
-        vco_col = add_param_slider_column("VCO")
-        add_param_slider(vco_col, "VCO Mix\n(0=VCO1, 1=VCO2)", "vco_mix",
+        # ---------- VCO bank (top) ----------
+        vco_bank, vco_row = create_bank("VCO", center=False)
+        add_param_slider(vco_row, "VCO Mix\n(0=VCO1, 1=VCO2)", "vco_mix",
                          0.0, 1.0, 0.5, "#3f88ff")
-        add_param_slider(vco_col, "VCO1 Wave\n(0=saw, 1=pulse)", "vco1_wave",
+        add_param_slider(vco_row, "VCO1 Wave\n(0=saw, 1=pulse)", "vco1_wave",
                          0.0, 1.0, 0.0, "#3f88ff")
-        add_param_slider(vco_col, "VCO2 Wave\n(0=saw, 1=pulse)", "vco2_wave",
+        add_param_slider(vco_row, "VCO2 Wave\n(0=saw, 1=pulse)", "vco2_wave",
                          0.0, 1.0, 0.0, "#3f88ff")
-        add_param_slider(vco_col, "Detune Ratio", "detune",
+        add_param_slider(vco_row, "Detune Ratio", "detune",
                          0.98, 1.08, 1.01, "#3f88ff")
-        panel_layout.addLayout(vco_col)
+        banks_layout.addLayout(vco_bank)
 
-        # FILTER
-        filt_col = add_param_slider_column("FILTER")
-        add_param_slider(filt_col, "Cutoff (Hz)", "cutoff",
+        # ---------- FILTER bank (directly under VCO) ----------
+        filt_bank, filt_row = create_bank("FILTER", center=False)
+        add_param_slider(filt_row, "Cutoff (Hz)", "cutoff",
                          100.0, 8000.0, 1200.0, "#ff8800")
-        add_param_slider(filt_col, "Resonance (0–1)", "res",
+        add_param_slider(filt_row, "Resonance (0–1)", "res",
                          0.0, 1.0, 0.2, "#ff8800")
-        add_param_slider(filt_col, "Filter Env Amount", "env_amt",
+        add_param_slider(filt_row, "Filter Env Amount", "env_amt",
                          0.0, 1.0, 0.5, "#ff8800")
-        add_param_slider(filt_col, "Noise Mix (0–1)", "noise_mix",
+        add_param_slider(filt_row, "Noise Mix (0–1)", "noise_mix",
                          0.0, 1.0, 0.0, "#ff8800")
-        panel_layout.addLayout(filt_col)
+        banks_layout.addLayout(filt_bank)
 
-        # LFO
-        lfo_col = add_param_slider_column("LFO")
-        add_param_slider(lfo_col, "LFO Freq (Hz)", "lfo_freq",
+        # ---------- LFO bank ----------
+        lfo_bank, lfo_row = create_bank("LFO", center=False)
+        add_param_slider(lfo_row, "LFO Freq (Hz)", "lfo_freq",
                          0.1, 20.0, 5.0, "#aa44ff")
-        add_param_slider(lfo_col, "LFO Depth (0–1)", "lfo_depth",
+        add_param_slider(lfo_row, "LFO Depth (0–1)", "lfo_depth",
                          0.0, 1.0, 0.0, "#aa44ff")
-        panel_layout.addLayout(lfo_col)
+        banks_layout.addLayout(lfo_bank)
 
-        # ENV
-        env_col = add_param_slider_column("ENV (ADSR)")
-        add_param_slider(env_col, "Attack (s)", "atk",
+        # ---------- ENV bank (centered) ----------
+        env_bank, env_row = create_bank("ENV (ADSR)", center=True)
+        add_param_slider(env_row, "Attack (s)", "atk",
                          0.001, 2.0, 0.01, "#44aa44")
-        add_param_slider(env_col, "Decay (s)", "dec",
+        add_param_slider(env_row, "Decay (s)", "dec",
                          0.01, 2.0, 0.1, "#44aa44")
-        add_param_slider(env_col, "Sustain (0–1)", "sus",
+        add_param_slider(env_row, "Sustain (0–1)", "sus",
                          0.0, 1.0, 0.7, "#44aa44")
-        add_param_slider(env_col, "Release (s)", "rel",
+        add_param_slider(env_row, "Release (s)", "rel",
                          0.01, 4.0, 0.3, "#44aa44")
-        panel_layout.addLayout(env_col)
+        banks_layout.addLayout(env_bank)
 
-        # AMP
-        amp_col = add_param_slider_column("AMP")
-        add_param_slider(amp_col, "Level", "amp",
+        # ---------- AMP bank (single slider, centered) ----------
+        amp_bank, amp_row = create_bank("AMP", center=True)
+        add_param_slider(amp_row, "Level", "amp",
                          0.0, 0.8, 0.2, "#222222")
-        panel_layout.addLayout(amp_col)
+        banks_layout.addLayout(amp_bank)
 
         # ------------------------------
-        # Row 4: Piano keyboard
+        # Bottom: Piano keyboard
         # ------------------------------
         self.piano_widget = PianoWidget(
             note_on_cb=self._handle_piano_note_on,
@@ -447,7 +462,7 @@ class SynthControlWindow(QtWidgets.QWidget):
         midi_note = int(self.note_combo.currentData())
         self.sc.note_on_midi(midi_note, velocity=100)
 
-        # Push current panel state into the active voice
+        # Push current panel state into the new voice
         for name, slider in self.param_sliders.items():
             self.sc.set_param(name, slider.get_value())
         target = int(self.lfo_target_combo.currentData())
