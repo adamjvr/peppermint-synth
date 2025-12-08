@@ -7,11 +7,17 @@ SynthControlWindow (PyQt6)
 
 Front-panel GUI for the SuperCollider-based synth.
 
-This version:
-- Uses ParameterSlider for ALL continuous parameters.
-- Centers the VCO, FILTER, LFO, ENV, and AMP banks.
-- Gives each slider a fixed width + small spacing so banks are tight,
-  like a real synth front panel (no huge gaps like before).
+Layout:
+- Top: Mode / LFO Target / Note / MIDI / Presets
+- Middle: parameter sections arranged HORIZONTALLY:
+
+    [ VCO
+      FILTER ]   [ LFO ]   [ ENV (ADSR) ]   [ AMP ]
+
+  VCO and FILTER are stacked vertically in one column, as requested.
+- Bottom: 25-key piano keyboard
+
+All continuous parameters use the same ParameterSlider widget.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ class ParameterSlider(QtWidgets.QWidget):
     ParameterSlider
     ===============
 
-    A reusable widget for a single continuous synth parameter:
+    Reusable widget for a single continuous synth parameter:
 
         [Label + current value]
         [   vertical slider    ]
@@ -58,8 +64,7 @@ class ParameterSlider(QtWidgets.QWidget):
         self.min_val = float(min_val)
         self.max_val = float(max_val)
 
-        # Make the whole fader module a fixed-ish width so layout
-        # can’t stretch it across the screen.
+        # Fixed-ish width so faders pack tightly and evenly.
         self.setFixedWidth(80)
 
         layout = QtWidgets.QVBoxLayout()
@@ -100,7 +105,6 @@ class ParameterSlider(QtWidgets.QWidget):
         self._base_label_text = label_text
 
         self.set_value(default, emit=False)
-
         self.slider.valueChanged.connect(self._on_slider_changed)
 
     # --------------------------------------------------------------
@@ -155,7 +159,7 @@ class SynthControlWindow(QtWidgets.QWidget):
 
         self.sc = sc_controller
 
-        self.setWindowTitle("PyQt6 SuperCollider Synth – ARP-style GUI")
+        self.setWindowTitle("Peppermint Synth - Roth Amplification Ltd")
         self.setStyleSheet("background-color: white; color: black;")
 
         self.param_sliders: Dict[str, ParameterSlider] = {}
@@ -253,14 +257,17 @@ class SynthControlWindow(QtWidgets.QWidget):
 
         main_layout.addLayout(second_layout)
 
-        # ---------- Middle: slider banks ----------
-        banks_layout = QtWidgets.QVBoxLayout()
-        banks_layout.setSpacing(12)
-        main_layout.addLayout(banks_layout)
+        # ---------- Middle: parameter sections (horizontal columns) ----------
+        panel_layout = QtWidgets.QHBoxLayout()
+        panel_layout.setSpacing(30)
+        main_layout.addLayout(panel_layout)
 
         def create_centered_bank(title: str):
             """
-            Create a centered bank (header + centered row of sliders).
+            Create a bank (header + centered row of sliders).
+
+            Returns:
+                (bank_layout, sliders_row_layout)
             """
             bank_layout = QtWidgets.QVBoxLayout()
             bank_layout.setSpacing(4)
@@ -271,7 +278,7 @@ class SynthControlWindow(QtWidgets.QWidget):
             bank_layout.addWidget(header)
 
             sliders_row = QtWidgets.QHBoxLayout()
-            sliders_row.setSpacing(6)  # tighter spacing between faders
+            sliders_row.setSpacing(6)  # tight spacing between faders
 
             wrapper = QtWidgets.QHBoxLayout()
             wrapper.addStretch(1)
@@ -302,7 +309,10 @@ class SynthControlWindow(QtWidgets.QWidget):
             self.param_sliders[param_name] = slider
             row_layout.addWidget(slider)
 
-        # VCO bank (centered & tight)
+        # ----- Column 1: VCO (top) + FILTER (bottom) -----
+        col_vco_filt = QtWidgets.QVBoxLayout()
+        col_vco_filt.setSpacing(12)
+
         vco_bank, vco_row = create_centered_bank("VCO")
         add_param_slider(vco_row, "VCO Mix\n(0=VCO1, 1=VCO2)", "vco_mix",
                          0.0, 1.0, 0.5, "#3f88ff")
@@ -312,9 +322,8 @@ class SynthControlWindow(QtWidgets.QWidget):
                          0.0, 1.0, 0.0, "#3f88ff")
         add_param_slider(vco_row, "Detune Ratio", "detune",
                          0.98, 1.08, 1.01, "#3f88ff")
-        banks_layout.addLayout(vco_bank)
+        col_vco_filt.addLayout(vco_bank)
 
-        # FILTER bank (centered & tight, just under VCO)
         filt_bank, filt_row = create_centered_bank("FILTER")
         add_param_slider(filt_row, "Cutoff (Hz)", "cutoff",
                          100.0, 8000.0, 1200.0, "#ff8800")
@@ -324,17 +333,23 @@ class SynthControlWindow(QtWidgets.QWidget):
                          0.0, 1.0, 0.5, "#ff8800")
         add_param_slider(filt_row, "Noise Mix (0–1)", "noise_mix",
                          0.0, 1.0, 0.0, "#ff8800")
-        banks_layout.addLayout(filt_bank)
+        col_vco_filt.addLayout(filt_bank)
 
-        # LFO bank (also centered/tight)
+        # ----- Column 2: LFO -----
+        col_lfo = QtWidgets.QVBoxLayout()
+        col_lfo.setSpacing(12)
+
         lfo_bank, lfo_row = create_centered_bank("LFO")
         add_param_slider(lfo_row, "LFO Freq (Hz)", "lfo_freq",
                          0.1, 20.0, 5.0, "#aa44ff")
         add_param_slider(lfo_row, "LFO Depth (0–1)", "lfo_depth",
                          0.0, 1.0, 0.0, "#aa44ff")
-        banks_layout.addLayout(lfo_bank)
+        col_lfo.addLayout(lfo_bank)
 
-        # ENV (ADSR) bank – centered (like before)
+        # ----- Column 3: ENV (ADSR) -----
+        col_env = QtWidgets.QVBoxLayout()
+        col_env.setSpacing(12)
+
         env_bank, env_row = create_centered_bank("ENV (ADSR)")
         add_param_slider(env_row, "Attack (s)", "atk",
                          0.001, 2.0, 0.01, "#44aa44")
@@ -344,13 +359,24 @@ class SynthControlWindow(QtWidgets.QWidget):
                          0.0, 1.0, 0.7, "#44aa44")
         add_param_slider(env_row, "Release (s)", "rel",
                          0.01, 4.0, 0.3, "#44aa44")
-        banks_layout.addLayout(env_bank)
+        col_env.addLayout(env_bank)
 
-        # AMP bank (single slider, centered)
+        # ----- Column 4: AMP -----
+        col_amp = QtWidgets.QVBoxLayout()
+        col_amp.setSpacing(12)
+
         amp_bank, amp_row = create_centered_bank("AMP")
         add_param_slider(amp_row, "Level", "amp",
                          0.0, 0.8, 0.2, "#222222")
-        banks_layout.addLayout(amp_bank)
+        col_amp.addLayout(amp_bank)
+
+        # Add columns to main panel row with stretch at ends
+        panel_layout.addStretch(1)
+        panel_layout.addLayout(col_vco_filt)
+        panel_layout.addLayout(col_lfo)
+        panel_layout.addLayout(col_env)
+        panel_layout.addLayout(col_amp)
+        panel_layout.addStretch(1)
 
         # ---------- Bottom: 25-key keyboard ----------
         self.piano_widget = PianoWidget(
