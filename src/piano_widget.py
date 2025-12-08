@@ -5,109 +5,44 @@ piano_widget.py
 ----------------------------------------------------------------------
 On-screen piano keyboard widget (PyQt6).
 
-CLASSES
--------
-- PianoKeyButton: A single key (white or black).
-- PianoWidget:    A one-octave keyboard (C4–B4).
+This version draws a *real* one-octave keyboard (C4–B4):
 
-This widget is UI-only and does not know about MIDI or SuperCollider.
-It simply calls note_on_cb(note) / note_off_cb(note) when keys are
-pressed/released.
+    White keys: C, D, E, F, G, A, B  (MIDI 60,62,64,65,67,69,71)
+    Black keys: C#,D#,   F#,G#,A#    (MIDI 61,63,   66,68,70)
+
+Implementation notes
+--------------------
+- Keys are plain QPushButtons with **manual geometry** (no layout),
+  recalculated in resizeEvent so they stretch with the window.
+- White keys are created first; black keys are created afterward and
+  `raise_()`'d so they sit visually on top.
+- Background is white; white keys use slightly off-white fill and a
+  dark border so they stand out clearly.
+- The public API is the same as before:
+
+      PianoWidget(note_on_cb, note_off_cb)
+
+  and it calls:
+
+      note_on_cb(midi_note)
+      note_off_cb(midi_note)
+
+  on mouse press / release.
 """
 
-from typing import Callable
+from typing import Callable, List, Dict
 
 from PyQt6 import QtWidgets, QtCore
-
-
-class PianoKeyButton(QtWidgets.QPushButton):
-    """
-    A single piano key (white or black).
-
-    Responsibilities:
-    -----------------
-    - Visual representation (size, color).
-    - Emit callbacks on press/release for a given MIDI note.
-    """
-
-    def __init__(
-        self,
-        note: int,
-        is_black: bool,
-        note_on_cb: Callable[[int], None],
-        note_off_cb: Callable[[int], None],
-        parent=None,
-    ):
-        """
-        Parameters
-        ----------
-        note : int
-            MIDI note number associated with this key.
-        is_black : bool
-            True if black key, False if white.
-        note_on_cb : Callable[[int], None]
-            Called when key is pressed.
-        note_off_cb : Callable[[int], None]
-            Called when key is released.
-        parent : QWidget, optional
-        """
-        super().__init__(parent)
-        self.note = note
-        self.is_black = is_black
-        self.note_on_cb = note_on_cb
-        self.note_off_cb = note_off_cb
-
-        self.setText("")
-        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-
-        if self.is_black:
-            self.setFixedSize(24, 60)
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: black;
-                    border: 1px solid #333333;
-                    border-radius: 2px;
-                }
-                QPushButton:pressed {
-                    background-color: #444444;
-                }
-            """)
-            self.raise_()
-        else:
-            self.setFixedSize(30, 100)
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: white;
-                    border: 1px solid #555555;
-                    border-radius: 2px;
-                }
-                QPushButton:pressed {
-                    background-color: #dddddd;
-                }
-            """)
-
-        self.pressed.connect(self._on_pressed)
-        self.released.connect(self._on_released)
-
-    def _on_pressed(self) -> None:
-        if self.note_on_cb:
-            self.note_on_cb(self.note)
-
-    def _on_released(self) -> None:
-        if self.note_off_cb:
-            self.note_off_cb(self.note)
 
 
 class PianoWidget(QtWidgets.QWidget):
     """
     One-octave piano keyboard (C4–B4, MIDI 60–71).
 
-    Layout:
-    -------
-    - White keys in a row.
-    - Black keys on top using a stacked layout.
+    - White keys: large buttons across the full width.
+    - Black keys: narrower buttons placed between white keys.
 
-    We approximate the black-key spacing with simple spacer widgets.
+    Used by the main GUI as the bottom play surface.
     """
 
     def __init__(
@@ -120,71 +55,160 @@ class PianoWidget(QtWidgets.QWidget):
         self.note_on_cb = note_on_cb
         self.note_off_cb = note_off_cb
 
-        self._build_ui()
+        # We manage geometry manually, so no layout here
+        self.setMinimumHeight(140)
 
-    def _build_ui(self) -> None:
-        outer_layout = QtWidgets.QHBoxLayout()
-        outer_layout.setContentsMargins(10, 0, 10, 0)
-        outer_layout.setSpacing(0)
-        self.setLayout(outer_layout)
+        # Data structures to hold key widgets
+        self.white_keys: List[Dict] = []
+        self.black_keys: List[Dict] = []
 
-        container = QtWidgets.QWidget()
-        container.setMinimumHeight(110)
-        container.setMaximumHeight(110)
+        self._create_keys()
 
-        # White keys layout
-        white_layout = QtWidgets.QHBoxLayout()
-        white_layout.setContentsMargins(0, 0, 0, 0)
-        white_layout.setSpacing(1)
+    # ------------------------------------------------------------------
+    # key creation
+    # ------------------------------------------------------------------
 
-        # Black keys layout (on top)
-        black_layout = QtWidgets.QHBoxLayout()
-        black_layout.setContentsMargins(15, 0, 0, 0)
-        black_layout.setSpacing(1)
+    def _create_keys(self) -> None:
+        """
+        Create white + black key QPushButtons and connect their signals.
 
-        white_notes = [60, 62, 64, 65, 67, 69, 71]  # C, D, E, F, G, A, B
-        black_notes = [
-            (61, 0.7),  # C#
-            (63, 1.7),  # D#
-            (66, 3.7),  # F#
-            (68, 4.7),  # G#
-            (70, 5.7),  # A#
+        Geometry is handled later in resizeEvent.
+        """
+        # Clear any existing keys (if we ever recreate)
+        for info in self.white_keys + self.black_keys:
+            info["button"].deleteLater()
+        self.white_keys.clear()
+        self.black_keys.clear()
+
+        # White key MIDI notes for C4–B4
+        white_notes = [60, 62, 64, 65, 67, 69, 71]
+
+        # Create white keys
+        for note in white_notes:
+            btn = QtWidgets.QPushButton(self)
+            btn.setText("")  # purely visual
+            btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+
+            # Slightly off-white so they show against the global white bg
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #fdfdfd;
+                    border: 2px solid #444444;
+                    border-radius: 3px;
+                }
+                QPushButton:pressed {
+                    background-color: #e0e0e0;
+                }
+            """)
+
+            btn.pressed.connect(lambda n=note: self._on_key_pressed(n))
+            btn.released.connect(lambda n=note: self._on_key_released(n))
+
+            self.white_keys.append({"note": note, "button": btn})
+
+        # Black key MIDI notes + their *left* white key index
+        #   C# above between C (index 0) and D (1)  -> left index 0
+        #   D# between D (1) and E (2)              -> left index 1
+        #   F# between F (3) and G (4)              -> left index 3
+        #   G# between G (4) and A (5)              -> left index 4
+        #   A# between A (5) and B (6)              -> left index 5
+        black_spec = [
+            (61, 0),  # C#
+            (63, 1),  # D#
+            (66, 3),  # F#
+            (68, 4),  # G#
+            (70, 5),  # A#
         ]
 
-        # Build white keys
-        for note in white_notes:
-            key = PianoKeyButton(
-                note=note,
-                is_black=False,
-                note_on_cb=self.note_on_cb,
-                note_off_cb=self.note_off_cb,
+        for note, left_index in black_spec:
+            btn = QtWidgets.QPushButton(self)
+            btn.setText("")
+            btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: black;
+                    border: 2px solid #000000;
+                    border-radius: 3px;
+                }
+                QPushButton:pressed {
+                    background-color: #444444;
+                }
+            """)
+
+            btn.pressed.connect(lambda n=note: self._on_key_pressed(n))
+            btn.released.connect(lambda n=note: self._on_key_released(n))
+
+            self.black_keys.append(
+                {
+                    "note": note,
+                    "left_index": left_index,  # we layout based on this later
+                    "button": btn,
+                }
             )
-            white_layout.addWidget(key)
 
-        # Build black keys using simple spacers
-        for (note, stretch_factor) in black_notes:
-            spacer = QtWidgets.QWidget()
-            spacer.setFixedWidth(int(30 * (stretch_factor - 1.0)))
-            black_layout.addWidget(spacer)
+        # Initial layout based on current size
+        self._layout_keys()
 
-            key = PianoKeyButton(
-                note=note,
-                is_black=True,
-                note_on_cb=self.note_on_cb,
-                note_off_cb=self.note_off_cb,
-            )
-            black_layout.addWidget(key)
+    # ------------------------------------------------------------------
+    # geometry / layout
+    # ------------------------------------------------------------------
 
-        white_widget = QtWidgets.QWidget()
-        white_widget.setLayout(white_layout)
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._layout_keys()
 
-        black_widget = QtWidgets.QWidget()
-        black_widget.setLayout(black_layout)
+    def _layout_keys(self) -> None:
+        """
+        Position white and black keys based on current widget size.
+        """
+        if not self.white_keys:
+            return
 
-        stack = QtWidgets.QStackedLayout()
-        stack.setStackingMode(QtWidgets.QStackedLayout.StackingMode.StackAll)
-        stack.addWidget(white_widget)
-        stack.addWidget(black_widget)
+        total_w = self.width()
+        total_h = self.height()
 
-        container.setLayout(stack)
-        outer_layout.addWidget(container)
+        # Reserve a bit of top/bottom margin
+        top_margin = 10
+        bottom_margin = 5
+
+        white_h = total_h - top_margin - bottom_margin
+        white_w = total_w / len(self.white_keys)
+
+        # --- layout white keys ---
+        for idx, info in enumerate(self.white_keys):
+            btn = info["button"]
+            x = int(idx * white_w)
+            y = top_margin
+            w = int(white_w)
+            h = int(white_h)
+            btn.setGeometry(x, y, w, h)
+            btn.lower()  # ensure white keys are underneath
+
+        # --- layout black keys ---
+        black_h = int(white_h * 0.6)
+        black_w = int(white_w * 0.6)
+        black_y = top_margin  # start at the same top as whites
+
+        for info in self.black_keys:
+            btn = info["button"]
+            left_idx = info["left_index"]
+
+            # Center the black key between left and next white key
+            center_x = (left_idx + 1) * white_w
+            x = int(center_x - black_w / 2)
+
+            btn.setGeometry(x, black_y, black_w, black_h)
+            btn.raise_()  # ensure black keys sit on top
+
+    # ------------------------------------------------------------------
+    # callbacks
+    # ------------------------------------------------------------------
+
+    def _on_key_pressed(self, note: int) -> None:
+        if self.note_on_cb:
+            self.note_on_cb(note)
+
+    def _on_key_released(self, note: int) -> None:
+        if self.note_off_cb:
+            self.note_off_cb(note)
