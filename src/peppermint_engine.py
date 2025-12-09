@@ -364,6 +364,13 @@ class PeppermintSynthEngine:
                     self._mono_voice.set(gate=0.0)
                 except Exception:
                     pass
+                # After sending gate=0, the EnvGen's done_action=2 will
+                # free the underlying synth node. To avoid Supriya
+                # spamming /n_set "Node not found" warnings when GUI
+                # parameters continue to call set() on a dead node,
+                # immediately drop our reference so future updates
+                # don't target this freed synth.
+                self._mono_voice = None
 
     def _handle_note_off_all(self) -> None:
         # Kill all polyphonic voices
