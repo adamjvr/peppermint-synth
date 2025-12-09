@@ -79,7 +79,14 @@ def peppermint_voice(
             release_time=rel,
         ),
         gate=gate,
-        done_action=2,           # free synth when envelope finishes
+        # IMPORTANT:
+        # Use done_action=0 so the synth node is NOT auto-freed when
+        # the envelope finishes. The engine will:
+        #   - In poly mode: gate=0 and forget the voice (no further .set),
+        #   - In mono mode: reuse the same node for new notes.
+        # This prevents '/n_set Node XXX not found' spam when you later
+        # tweak parameters on voices SC already killed.
+        done_action=0,
     )
 
     # --- Filter envelope (full sustain; amount set by env_amt) ---
