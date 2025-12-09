@@ -160,6 +160,19 @@ class SynthControlWindow(QtWidgets.QWidget):
         main_layout.setSpacing(10)
         self.setLayout(main_layout)
 
+        # SuperCollider status label (top-left)
+        self.sc_status_label = QtWidgets.QLabel("SuperCollider: initializing")
+        self.sc_status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.sc_status_label.setStyleSheet("color: black;")
+        main_layout.addWidget(self.sc_status_label)
+
+        # Timer to poll engine.get_status() and update the label
+        self._sc_status_timer = QtCore.QTimer(self)
+        self._sc_status_timer.setInterval(500)  # ms
+        self._sc_status_timer.timeout.connect(self._update_sc_status_label)
+        self._sc_status_timer.start()
+
+
         # ---------- Row 1: mode + LFO target + note ----------
         top_layout = QtWidgets.QHBoxLayout()
 
@@ -486,7 +499,38 @@ class SynthControlWindow(QtWidgets.QWidget):
                 slider.set_value(float(value), emit=False)
                 self.engine.set_param(name, float(value))
 
+    
     # ------------------------------------------------------------------
+    # SuperCollider status polling
+    # ------------------------------------------------------------------
+
+    def _update_sc_status_label(self) -> None:
+        """Poll engine.get_status() and update the SuperCollider status label."""
+        try:
+            status, error = self.engine.get_status()
+        except Exception:
+            # If engine does not provide status for some reason, bail quietly.
+            return
+
+        text = f"SuperCollider: {status}"
+        color = "black"
+
+        if status.lower().startswith("running"):
+            color = "green"
+        elif status.lower().startswith("error"):
+            color = "red"
+            if error:
+                text += f" ({error})"
+        elif "booting" in status.lower():
+            color = "orange"
+        elif "warning" in status.lower():
+            color = "darkorange"
+            if error:
+                text += f" ({error})"
+
+        self.sc_status_label.setText(text)
+        self.sc_status_label.setStyleSheet(f"color: {color};")
+# ------------------------------------------------------------------
     # Clean shutdown hook
     # ------------------------------------------------------------------
 
