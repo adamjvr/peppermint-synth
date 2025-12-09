@@ -156,6 +156,7 @@ def peppermint_voice(
 # Threaded Supriya engine with mono/poly modes
 # ------------------------------------------------------------------
 
+
 class PeppermintSynthEngine:
     """Threaded wrapper around Supriya's Server and peppermint_voice SynthDef.
 
@@ -174,6 +175,11 @@ class PeppermintSynthEngine:
         self._command_queue: "queue.Queue" = queue.Queue()
         self._running: bool = True
 
+        # SuperCollider / Supriya status tracking
+        self._status: str = "initializing"
+        self._last_error: str = ""
+        self._status_lock = threading.Lock()
+
         # Supriya server and group, only used on worker thread
         self._server: Optional[supriya.Server] = None
         self._synth_group = None
@@ -191,7 +197,30 @@ class PeppermintSynthEngine:
         )
         self._thread.start()
 
-    # ---------------- Public API (GUI thread) ----------------
+    # ------------------------------------------------------------------
+    # Status helpers
+    # ------------------------------------------------------------------
+
+    def _set_status(self, status: str, error: str = "") -> None:
+        """Update internal SuperCollider status string and optional error,
+        and log to stdout for diagnostics.
+        """
+        with self._status_lock:
+            self._status = status
+            self._last_error = error
+        if error:
+            print(f"[SC_STATUS] {status}: {error}")
+        else:
+            print(f"[SC_STATUS] {status}")
+
+    def get_status(self) -> tuple[str, str]:
+        """Return (status, last_error) for GUI polling."""
+        with self._status_lock:
+            return self._status, self._last_error
+
+    # ------------------------------------------------------------------
+    # Public API (GUI / MIDI thread)
+    # ------------------------------------------------------------------
 
     def set_poly_mode(self, is_poly: bool) -> None:
         self._command_queue.put(("set_poly_mode", bool(is_poly)))
@@ -212,21 +241,55 @@ class PeppermintSynthEngine:
         self._running = False
         self._command_queue.put(("shutdown",))
 
-    # ---------------- Helper ----------------
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _midi_to_hz(midi_note: int) -> float:
         """Standard 440Hz concert pitch conversion."""
         return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
 
-    # ---------------- Worker thread entry ----------------
+    @staticmethod
+    def _safe_set(node, **controls) -> bool:
+        """Safely set controls on a node, avoiding 'Node not found' spam.
+
+        Returns True if the set call likely succeeded, False if the node
+        appears to be freed or any error occurred.
+        """
+        if node is None:
+            return False
+        try:
+            # If Supriya exposes 'is_allocated', respect it.
+            if hasattr(node, "is_allocated") and not node.is_allocated:
+                return False
+            node.set(**controls)
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Worker thread entry
+    # ------------------------------------------------------------------
 
     def _thread_main(self) -> None:
         """Boot server, install SynthDef, process commands until shutdown."""
-        server = supriya.Server().boot()
-        self._server = server
 
-        # Install SynthDef and sync
+        self._set_status("booting")
+        print("[ENGINE] Worker thread starting, booting Supriya server...")
+
+        # Boot Supriya server (use default options for now)
+        try:
+            server = supriya.Server().boot()
+        except Exception as exc:
+            self._set_status("error", f"Server boot failed: {exc}")
+            return
+
+        print("[ENGINE] Supriya server booted:", server)
+        self._server = server
+        self._set_status("running")
+
+        # Install SynthDef and sync (pre-load our voice definition)
         server.add_synthdefs(peppermint_voice)
         server.sync()
 
@@ -250,7 +313,7 @@ class PeppermintSynthEngine:
             "dec": 0.1,
             "sus": 0.7,
             "rel": 0.3,
-            "amp": 0.2,
+            "amp": 0.3,
         }
 
         # Main command loop
@@ -296,7 +359,12 @@ class PeppermintSynthEngine:
         except Exception:
             pass
 
-    # ---------------- Internal handlers (audio thread only) ----------------
+        self._set_status("stopped")
+        print("[ENGINE] Worker thread exiting; server stopped.")
+
+    # ------------------------------------------------------------------
+    # Internal handlers (audio thread only)
+    # ------------------------------------------------------------------
 
     def _handle_set_param(self, name: str, value: float) -> None:
         # Ignore unknown param names
@@ -307,23 +375,23 @@ class PeppermintSynthEngine:
 
         # Propagate to any active voices
         if self._mono_voice is not None:
-            try:
-                self._mono_voice.set(**{name: value})
-            except Exception:
-                pass
+            if not self._safe_set(self._mono_voice, **{name: value}):
+                self._mono_voice = None
 
-        for voice in list(self._poly_voices.values()):
-            try:
-                voice.set(**{name: value})
-            except Exception:
-                pass
+        # Copy list to avoid mutation during iteration
+        for midi_note, voice in list(self._poly_voices.items()):
+            if not self._safe_set(voice, **{name: value}):
+                # Voice likely freed, drop from dict
+                self._poly_voices.pop(midi_note, None)
 
     def _handle_note_on(self, midi_note: int, velocity: int) -> None:
         if self._server is None or self._synth_group is None:
             return
 
+        print(f"[ENGINE] note_on: midi_note={midi_note}, velocity={velocity}")
+
         frequency = self._midi_to_hz(midi_note)
-        base_amp = self._global_params.get("amp", 0.2)
+        base_amp = self._global_params.get("amp", 0.3)
         amp = max(0.0, min(1.0, velocity / 127.0)) * base_amp
 
         if self._poly_mode:
@@ -345,46 +413,41 @@ class PeppermintSynthEngine:
                     **controls,
                 )
             else:
-                try:
-                    self._mono_voice.set(frequency=frequency, amp=amp, gate=1.0)
-                except Exception:
-                    pass
+                if not self._safe_set(self._mono_voice, frequency=frequency, amp=amp, gate=1.0):
+                    # If set failed, re-create mono voice
+                    controls = dict(self._global_params)
+                    controls.update({"frequency": frequency, "amp": amp, "gate": 1.0})
+                    self._mono_voice = self._synth_group.add_synth(
+                        synthdef=peppermint_voice,
+                        **controls,
+                    )
 
     def _handle_note_off(self, midi_note: int) -> None:
         if self._poly_mode:
             voice = self._poly_voices.pop(midi_note, None)
             if voice is not None:
-                try:
-                    voice.set(gate=0.0)
-                except Exception:
+                if not self._safe_set(voice, gate=0.0):
+                    # Already freed; ignore
                     pass
         else:
             if self._mono_voice is not None:
-                try:
-                    self._mono_voice.set(gate=0.0)
-                except Exception:
-                    pass
-                # After sending gate=0, the EnvGen's done_action=2 will
-                # free the underlying synth node. To avoid Supriya
-                # spamming /n_set "Node not found" warnings when GUI
-                # parameters continue to call set() on a dead node,
-                # immediately drop our reference so future updates
-                # don't target this freed synth.
-                self._mono_voice = None
+                if self._safe_set(self._mono_voice, gate=0.0):
+                    # After gate=0, EnvGen.done_action=2 frees the node,
+                    # so we drop our reference to avoid later /n_set spam.
+                    self._mono_voice = None
+                else:
+                    self._mono_voice = None
 
     def _handle_note_off_all(self) -> None:
         # Kill all polyphonic voices
         for midi_note, voice in list(self._poly_voices.items()):
-            try:
-                voice.set(gate=0.0)
-            except Exception:
+            if self._safe_set(voice, gate=0.0):
                 pass
         self._poly_voices.clear()
 
         # Kill mono voice
         if self._mono_voice is not None:
-            try:
-                self._mono_voice.set(gate=0.0)
-            except Exception:
+            if self._safe_set(self._mono_voice, gate=0.0):
                 pass
             self._mono_voice = None
+
