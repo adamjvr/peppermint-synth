@@ -154,6 +154,31 @@ class SynthControlWindow(QtWidgets.QWidget):
 
         self._build_ui()
         self._setup_midi()
+        # Poll SuperCollider server status periodically so we can reflect
+        # it in the GUI label without tight coupling.
+        self._sc_status_timer = QtCore.QTimer(self)
+        self._sc_status_timer.setInterval(500)  # 2x per second
+        self._sc_status_timer.timeout.connect(self._poll_sc_status)
+        self._sc_status_timer.start()
+
+
+    def _poll_sc_status(self) -> None:
+        """Update the SC status label based on engine.is_server_running()."""
+        label = getattr(self, "sc_status_label", None)
+        if label is None:
+            return
+        running = False
+        try:
+            running = bool(self.engine.is_server_running())
+        except Exception:
+            running = False
+
+        if running:
+            label.setText("SC: running")
+            label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            label.setText("SC: stopped")
+            label.setStyleSheet("color: red; font-weight: bold;")
 
     # ------------------------------------------------------------------
     # UI
@@ -201,6 +226,10 @@ class SynthControlWindow(QtWidgets.QWidget):
         self.note_on_button.clicked.connect(self._on_note_on_button)
         self.note_off_button.clicked.connect(self._on_note_off_button)
 
+        # SuperCollider status label (updated via timer)
+        self.sc_status_label = QtWidgets.QLabel("SC: unknown")
+        self.sc_status_label.setStyleSheet("color: black; font-weight: bold;")
+
         top_layout.addWidget(mode_lbl)
         top_layout.addWidget(self.poly_mode_combo)
         top_layout.addSpacing(20)
@@ -211,6 +240,8 @@ class SynthControlWindow(QtWidgets.QWidget):
         top_layout.addWidget(self.note_combo)
         top_layout.addWidget(self.note_on_button)
         top_layout.addWidget(self.note_off_button)
+        top_layout.addSpacing(20)
+        top_layout.addWidget(self.sc_status_label)
 
         main_layout.addLayout(top_layout)
 
@@ -230,23 +261,28 @@ class SynthControlWindow(QtWidgets.QWidget):
         self.save_preset_button.clicked.connect(self._on_save_preset)
         self.load_preset_button.clicked.connect(self._on_load_preset)
 
+        # SuperCollider audio device controls
+        device_lbl = QtWidgets.QLabel("SC Device:")
+        device_lbl.setStyleSheet("color: black;")
+        self.audio_device_edit = QtWidgets.QLineEdit()
+        self.audio_device_edit.setPlaceholderText(
+            "e.g. PipeWire or hw:0,0 (blank = default)"
+        )
+
+        self.reboot_audio_button = QtWidgets.QPushButton("Reboot Audio")
+        self.reboot_audio_button.clicked.connect(self._on_reboot_audio)
+
+        self.jack_routing_button = QtWidgets.QPushButton("JACK Routing…")
+        self.jack_routing_button.clicked.connect(self._on_open_jack_routing)
+
         second_layout.addWidget(midi_lbl)
         second_layout.addWidget(self.midi_port_combo)
         second_layout.addWidget(self.midi_refresh_button)
-        second_layout.addSpacing(20)
+        second_layout.addStretch(1)
         second_layout.addWidget(self.save_preset_button)
         second_layout.addWidget(self.load_preset_button)
         second_layout.addSpacing(20)
-        # SuperCollider audio device + controls
-        sc_lbl = QtWidgets.QLabel("SC Device:")
-        sc_lbl.setStyleSheet("color: black;")
-        self.audio_device_edit = QtWidgets.QLineEdit()
-        self.audio_device_edit.setPlaceholderText("e.g. hw:0,0 or PipeWire (blank = default)")
-        self.reboot_audio_button = QtWidgets.QPushButton("Reboot Audio")
-        self.reboot_audio_button.clicked.connect(self._on_reboot_audio)
-        self.jack_routing_button = QtWidgets.QPushButton("JACK Routing...")
-        self.jack_routing_button.clicked.connect(self._open_jack_routing_dialog)
-        second_layout.addWidget(sc_lbl)
+        second_layout.addWidget(device_lbl)
         second_layout.addWidget(self.audio_device_edit)
         second_layout.addWidget(self.reboot_audio_button)
         second_layout.addWidget(self.jack_routing_button)
@@ -366,44 +402,7 @@ class SynthControlWindow(QtWidgets.QWidget):
         )
         main_layout.addWidget(self.piano_widget)
 
-    
     # ------------------------------------------------------------------
-    # SuperCollider audio control helpers
-    # ------------------------------------------------------------------
-
-    def _on_reboot_audio(self) -> None:
-        """
-        Read the SC device string from the line edit and ask the engine to
-        reboot audio with that override, if supported.
-        """
-        text = self.audio_device_edit.text().strip() if hasattr(self, "audio_device_edit") else ""
-        device = text if text else None
-
-        # Be defensive in case the engine running on the user's machine
-        # doesn't yet expose these newer methods.
-        if hasattr(self.engine, "set_audio_device"):
-            try:
-                self.engine.set_audio_device(device)
-            except Exception as exc:
-                print(f"[GUI] set_audio_device failed: {exc}")
-        else:
-            print("[GUI] Engine has no set_audio_device(...) method.")
-
-        if hasattr(self.engine, "reboot_audio"):
-            try:
-                self.engine.reboot_audio()
-            except Exception as exc:
-                print(f"[GUI] reboot_audio failed: {exc}")
-        else:
-            print("[GUI] Engine has no reboot_audio() method.")
-
-    def _open_jack_routing_dialog(self) -> None:
-        """Open a simple dialog to connect SC outputs to system playback via JACK."""
-        dlg = JackRoutingDialog(self)
-        dlg.exec()
-
-
-# ------------------------------------------------------------------
     # MIDI setup
     # ------------------------------------------------------------------
 
@@ -515,6 +514,32 @@ class SynthControlWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Error Loading Preset", str(exc))
             return
 
+    # ---------- Audio device + JACK helpers ----------
+
+    def _on_reboot_audio(self) -> None:
+        """Called when the user clicks the 'Reboot Audio' button."""
+        device_text = ""
+        if hasattr(self, "audio_device_edit") and self.audio_device_edit is not None:
+            device_text = self.audio_device_edit.text().strip()
+
+        # Tell the engine about the new device override (may be empty).
+        try:
+            self.engine.set_audio_device(device_text if device_text else None)
+        except Exception as exc:
+            print(f"[GUI] set_audio_device failed: {exc}")
+
+        # Request a reboot; engine will handle in its worker thread.
+        try:
+            self.engine.reboot_audio()
+        except Exception as exc:
+            print(f"[GUI] reboot_audio failed: {exc}")
+
+    def _on_open_jack_routing(self) -> None:
+        """Open the JACK / PipeWire routing helper dialog."""
+        dlg = JackRoutingDialog(self)
+        dlg.exec()
+
+
         poly_mode = bool(preset.get("poly_mode", False))
         self.poly_mode_combo.setCurrentIndex(1 if poly_mode else 0)
         self.engine.set_poly_mode(poly_mode)
@@ -542,104 +567,6 @@ class SynthControlWindow(QtWidgets.QWidget):
                 slider.set_value(float(value), emit=False)
                 self.engine.set_param(name, float(value))
 
-
-class JackRoutingDialog(QtWidgets.QDialog):
-    """
-    Simple dialog to connect SuperCollider outputs to system playback ports
-    via JACK / PipeWire-JACK (jack_lsp + jack_connect).
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("JACK / PipeWire Routing")
-        self.setModal(True)
-
-        self.sc_ports = []
-        self.playback_ports = []
-
-        self._build_ui()
-        self._refresh_ports()
-
-    def _build_ui(self) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
-
-        info_label = QtWidgets.QLabel(
-            "Select SuperCollider output ports and system playback ports.\n"
-            "Then click 'Connect L/R' to wire them via JACK.\n\n"
-            "Requires: JACK or PipeWire-JACK, jack_lsp, jack_connect."
-        )
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-
-        hlayout = QtWidgets.QHBoxLayout()
-
-        sc_group = QtWidgets.QGroupBox("SuperCollider outputs")
-        sc_layout = QtWidgets.QVBoxLayout(sc_group)
-        self.sc_list = QtWidgets.QListWidget()
-        sc_layout.addWidget(self.sc_list)
-        hlayout.addWidget(sc_group)
-
-        sys_group = QtWidgets.QGroupBox("System playback ports")
-        sys_layout = QtWidgets.QVBoxLayout(sys_group)
-        self.playback_list = QtWidgets.QListWidget()
-        sys_layout.addWidget(self.playback_list)
-        hlayout.addWidget(sys_group)
-
-        layout.addLayout(hlayout)
-
-        ctrl_layout = QtWidgets.QHBoxLayout()
-        self.refresh_button = QtWidgets.QPushButton("Refresh")
-        self.refresh_button.clicked.connect(self._refresh_ports)
-        ctrl_layout.addWidget(self.refresh_button)
-
-        self.connect_button = QtWidgets.QPushButton("Connect L/R")
-        self.connect_button.clicked.connect(self._connect_lr)
-        ctrl_layout.addWidget(self.connect_button)
-
-        ctrl_layout.addStretch(1)
-
-        self.close_button = QtWidgets.QPushButton("Close")
-        self.close_button.clicked.connect(self.accept)
-        ctrl_layout.addWidget(self.close_button)
-
-        layout.addLayout(ctrl_layout)
-
-    def _refresh_ports(self) -> None:
-        """Reload SC and system playback port lists."""
-        self.sc_ports = list_supercollider_output_ports()
-        self.playback_ports = list_playback_ports()
-
-        self.sc_list.clear()
-        for p in self.sc_ports:
-            self.sc_list.addItem(p)
-
-        self.playback_list.clear()
-        for p in self.playback_ports:
-            self.playback_list.addItem(p)
-
-    def _connect_lr(self) -> None:
-        """Connect first two selected SC ports to first two selected playback ports."""
-        sc_sel = [item.text() for item in self.sc_list.selectedItems()]
-        pb_sel = [item.text() for item in self.playback_list.selectedItems()]
-
-        if len(sc_sel) < 2 or len(pb_sel) < 2:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Selection required",
-                "Select at least two SC outputs and two playback ports "
-                "to form a stereo L/R pair.",
-            )
-            return
-
-        sc_left, sc_right = sc_sel[0], sc_sel[1]
-        pb_left, pb_right = pb_sel[0], pb_sel[1]
-
-        ok_l, ok_r = connect_stereo_pair(sc_left, sc_right, pb_left, pb_right)
-
-        msg = f"Left: {'OK' if ok_l else 'FAILED'}\nRight: {'OK' if ok_r else 'FAILED'}"
-        QtWidgets.QMessageBox.information(self, "JACK connect result", msg)
-
-
     # ------------------------------------------------------------------
     # Clean shutdown hook
     # ------------------------------------------------------------------
@@ -649,3 +576,153 @@ class JackRoutingDialog(QtWidgets.QDialog):
             self.midi_manager.shutdown()
         self.engine.shutdown()
         super().closeEvent(event)
+
+
+
+class JackRoutingDialog(QtWidgets.QDialog):
+    """Simple helper dialog for JACK / PipeWire routing.
+
+    It shells out to `jack_lsp` and `jack_connect` via the helper functions
+    in peppermint_jack_routing.py to connect SuperCollider's output ports
+    to system playback (or any other sink).
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("JACK / PipeWire Routing")
+        self.resize(700, 400)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Instructions
+        info = QtWidgets.QLabel(
+            "Select two SuperCollider outputs and two playback ports, then\n"
+            "press 'Connect L/R' to wire them together via jack_connect."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        lists_layout = QtWidgets.QHBoxLayout()
+        layout.addLayout(lists_layout)
+
+        # SuperCollider outputs list
+        sc_layout = QtWidgets.QVBoxLayout()
+        lists_layout.addLayout(sc_layout)
+
+        sc_label = QtWidgets.QLabel("SuperCollider outputs:")
+        sc_layout.addWidget(sc_label)
+
+        self.sc_list = QtWidgets.QListWidget()
+        self.sc_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        sc_layout.addWidget(self.sc_list)
+
+        # Playback ports list
+        pb_layout = QtWidgets.QVBoxLayout()
+        lists_layout.addLayout(pb_layout)
+
+        pb_label = QtWidgets.QLabel("Playback / sink ports:")
+        pb_layout.addWidget(pb_label)
+
+        self.pb_list = QtWidgets.QListWidget()
+        self.pb_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        pb_layout.addWidget(self.pb_list)
+
+        # Buttons
+        btn_layout = QtWidgets.QHBoxLayout()
+        layout.addLayout(btn_layout)
+
+        self.refresh_button = QtWidgets.QPushButton("Refresh Ports")
+        self.refresh_button.clicked.connect(self._refresh_ports)
+        btn_layout.addWidget(self.refresh_button)
+
+        self.connect_button = QtWidgets.QPushButton("Connect L/R")
+        self.connect_button.clicked.connect(self._connect_lr)
+        btn_layout.addWidget(self.connect_button)
+
+        btn_layout.addStretch(1)
+
+        self.close_button = QtWidgets.QPushButton("Close")
+        self.close_button.clicked.connect(self.accept)
+        btn_layout.addWidget(self.close_button)
+
+        # Initial population
+        self._refresh_ports()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _refresh_ports(self) -> None:
+        """Refresh the JACK port lists using jack_lsp via helpers."""
+        self.sc_list.clear()
+        self.pb_list.clear()
+
+        try:
+            sc_ports = list_supercollider_output_ports()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "JACK Error",
+                f"Failed to list SuperCollider ports via jack_lsp:\n{exc}",
+            )
+            sc_ports = []
+
+        try:
+            pb_ports = list_playback_ports()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "JACK Error",
+                f"Failed to list playback ports via jack_lsp:\n{exc}",
+            )
+            pb_ports = []
+
+        for name in sc_ports:
+            self.sc_list.addItem(name)
+        for name in pb_ports:
+            self.pb_list.addItem(name)
+
+    def _connect_lr(self) -> None:
+        """Connect selected SC outputs to selected playback ports as L/R."""
+        sc_selected = [i.text() for i in self.sc_list.selectedItems()]
+        pb_selected = [i.text() for i in self.pb_list.selectedItems()]
+
+        if len(sc_selected) < 2 or len(pb_selected) < 2:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Selection Required",
+                "Please select at least two SC outputs and two playback ports.",
+            )
+            return
+
+        sc_left, sc_right = sc_selected[0], sc_selected[1]
+        pb_left, pb_right = pb_selected[0], pb_selected[1]
+
+        try:
+            ok_left, msg_left = connect_stereo_pair(
+                sc_left, sc_right, pb_left, pb_right
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "JACK Error",
+                f"Error while calling jack_connect:\n{exc}",
+            )
+            return
+
+        if ok_left:
+            QtWidgets.QMessageBox.information(
+                self,
+                "JACK Routing",
+                f"Connected:\n  {sc_left} → {pb_left}\n  {sc_right} → {pb_right}",
+            )
+        else:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "JACK Routing",
+                f"Routing failed:\n{msg_left}",
+            )

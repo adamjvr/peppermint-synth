@@ -156,7 +156,6 @@ def peppermint_voice(
 # Threaded Supriya engine with mono/poly modes
 # ------------------------------------------------------------------
 
-
 class PeppermintSynthEngine:
     """Threaded wrapper around Supriya's Server and peppermint_voice SynthDef.
 
@@ -175,17 +174,13 @@ class PeppermintSynthEngine:
         self._command_queue: "queue.Queue" = queue.Queue()
         self._running: bool = True
 
-        # SuperCollider / Supriya status tracking
-        self._status: str = "initializing"
-        self._last_error: str = ""
-        self._status_lock = threading.Lock()
-
-                # Selected audio device name (None = default)
-        self._audio_device: Optional[str] = None
-
-# Supriya server and group, only used on worker thread
+        # Supriya server and group, only used on worker thread
         self._server: Optional[supriya.Server] = None
         self._synth_group = None
+
+        # Optional override for SuperCollider audio device name.
+        # If None or empty, Supriya / scsynth will use its default device.
+        self._audio_device: Optional[str] = None
 
         # Voice/param state
         self._poly_mode: bool = False
@@ -200,40 +195,7 @@ class PeppermintSynthEngine:
         )
         self._thread.start()
 
-    # ------------------------------------------------------------------
-    # Status helpers
-    # ------------------------------------------------------------------
-
-    def _set_status(self, status: str, error: str = "") -> None:
-        """Update internal SuperCollider status string and optional error,
-        and log to stdout for diagnostics.
-        """
-        with self._status_lock:
-            self._status = status
-            self._last_error = error
-        if error:
-            print(f"[SC_STATUS] {status}: {error}")
-        else:
-            print(f"[SC_STATUS] {status}")
-
-    def get_status(self) -> tuple[str, str]:
-        """Return (status, last_error) for GUI polling."""
-        with self._status_lock:
-            return self._status, self._last_error
-
-    # ------------------------------------------------------------------
-    # Public API (GUI / MIDI thread)
-    # ------------------------------------------------------------------
-
-    def set_audio_device(self, device: Optional[str]) -> None:
-        """Request a change to the SuperCollider audio device.
-        Pass None or an empty string to use the default device.
-        """
-        self._command_queue.put(("set_audio_device", device))
-
-    def reboot_audio(self) -> None:
-        """Request a reboot of the audio engine with current settings."""
-        self._command_queue.put(("reboot",))
+    # ---------------- Public API (GUI thread) ----------------
 
     def set_poly_mode(self, is_poly: bool) -> None:
         self._command_queue.put(("set_poly_mode", bool(is_poly)))
@@ -254,159 +216,233 @@ class PeppermintSynthEngine:
         self._running = False
         self._command_queue.put(("shutdown",))
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+
+    # ---------------- SuperCollider audio control (public API) -----------
+
+    def set_audio_device(self, device: Optional[str]) -> None:
+        """
+        Set the desired SuperCollider audio device string.
+
+        This does NOT immediately reboot the server; it only stores the
+        requested device. The next call to reboot_audio() (or the next
+        internal boot) will use this value when constructing ServerOptions.
+
+        Examples of valid device strings depend on your SC build, e.g.:
+            - "PipeWire"
+            - "PulseAudio"
+            - "hw:0,0"
+        """
+        # Normalize empty strings to None
+        if device:
+            self._audio_device = str(device)
+        else:
+            self._audio_device = None
+
+    def reboot_audio(self) -> None:
+        """
+        Request an in-place audio reboot on the worker thread.
+
+        This enqueues a 'reboot' command; the worker thread will:
+            - stop all voices
+            - free the current group and server
+            - boot a new server, using any configured _audio_device override
+            - reinstall the SynthDef and re-create the main group
+        """
+        # If the thread is not running, do nothing.
+        if not self._running:
+            return
+        self._command_queue.put(("reboot",))
+
+    def is_server_running(self) -> bool:
+        """
+        Lightweight check for GUI polling: True if the Supriya server
+        has been created and is still attached.
+        """
+        return self._server is not None
+
+    # ---------------- Internal boot helper (audio thread only) -----------
+
+    def _boot_server_locked(self) -> None:
+        """
+        (Worker thread only) Boot / reboot the Supriya server.
+
+        - If an existing server is running, all voices are silenced,
+          the main group is freed, and the server is quit.
+        - A new server is then booted, optionally using self._audio_device
+          as the device string (via supriya.ServerOptions).
+        - The peppermint_voice SynthDef is installed and synced.
+        - The main synth group and global parameter defaults are re-created.
+        """
+        # First, stop any existing voices and free group/server if present.
+        self._handle_note_off_all()
+
+        # Free group
+        try:
+            if self._synth_group is not None:
+                self._synth_group.free()
+        except Exception:
+            pass
+        self._synth_group = None
+
+        # Quit old server
+        try:
+            if self._server is not None:
+                self._server.quit()
+        except Exception:
+            pass
+        self._server = None
+
+        # Construct options if a device override is present
+        server = None
+        try:
+            options = None
+            if self._audio_device:
+                try:
+                    options = supriya.ServerOptions()
+                    options.device = self._audio_device
+                except Exception:
+                    # Fall back to default options if this fails
+                    options = None
+
+            if options is not None:
+                server = supriya.Server(options=options).boot()
+            else:
+                server = supriya.Server().boot()
+        except Exception as exc:
+            # If boot fails, leave _server as None and re-raise for visibility
+            print(f"[ENGINE] Failed to boot Supriya server: {exc}")
+            self._server = None
+            return
+
+        self._server = server
+
+        # Install SynthDef and sync
+        try:
+            server.add_synthdefs(peppermint_voice)
+            server.sync()
+        except Exception as exc:
+            print(f"[ENGINE] Failed to install SynthDef: {exc}")
+            return
+
+        # Group that contains all voices
+        try:
+            self._synth_group = server.add_group()
+        except Exception as exc:
+            print(f"[ENGINE] Failed to create main synth group: {exc}")
+            self._synth_group = None
+            return
+
+        # Initialize global params (must match SynthDef defaults)
+        self._global_params = {
+            "vco_mix": 0.5,
+            "vco1_wave": 0.0,
+            "vco2_wave": 0.0,
+            "vco1_tune": 0.0,
+            "vco2_tune": 0.0,
+            "vco2_detune": 0.0,
+            "noise_mix": 0.0,
+            "cutoff": 1000.0,
+            "res": 0.2,
+            "env_amt": 0.5,
+            "lfo_freq": 5.0,
+            "lfo_depth": 0.0,
+            "lfo_target": 0.0,
+            "atk": 0.01,
+            "dec": 0.1,
+            "sus": 0.7,
+            "rel": 0.3,
+            "amp": 0.2,
+        }
+
+    # ---------------- Helper ----------------
 
     @staticmethod
     def _midi_to_hz(midi_note: int) -> float:
         """Standard 440Hz concert pitch conversion."""
         return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
 
-    @staticmethod
-    def _safe_set(node, **controls) -> bool:
-        """Safely set controls on a node, avoiding 'Node not found' spam.
-
-        Returns True if the set call likely succeeded, False if the node
-        appears to be freed or any error occurred.
-        """
-        if node is None:
-            return False
-        try:
-            # If Supriya exposes 'is_allocated', respect it.
-            if hasattr(node, "is_allocated") and not node.is_allocated:
-                return False
-            node.set(**controls)
-            return True
-        except Exception:
-            return False
-
-    # ------------------------------------------------------------------
-    # Worker thread entry
-    # ------------------------------------------------------------------
+    # ---------------- Worker thread entry ----------------
 
     def _thread_main(self) -> None:
-        """Boot server, install SynthDef, process commands; support reboot and
-        configurable audio device via self._audio_device.
-        """
+        """Boot server, install SynthDef, process commands until shutdown."""
+        server = supriya.Server().boot()
+        self._server = server
 
+        # Install SynthDef and sync
+        server.add_synthdefs(peppermint_voice)
+        server.sync()
+
+        # Group that contains all voices
+        self._synth_group = server.add_group()
+
+        # Initialize global params (must match SynthDef defaults)
+        self._global_params = {
+            "vco_mix": 0.5,
+            "vco1_wave": 0.0,
+            "vco2_wave": 0.0,
+            "detune": 1.01,
+            "cutoff": 1200.0,
+            "res": 0.2,
+            "env_amt": 0.5,
+            "noise_mix": 0.0,
+            "lfo_freq": 5.0,
+            "lfo_depth": 0.0,
+            "lfo_target": 0.0,
+            "atk": 0.01,
+            "dec": 0.1,
+            "sus": 0.7,
+            "rel": 0.3,
+            "amp": 0.2,
+        }
+
+        # Main command loop
         while self._running:
-            self._set_status("booting")
-            print("[ENGINE] Worker thread starting, booting Supriya server...")
-
-            # Prepare Supriya server options (honor audio device override if set)
-            server = None
             try:
-                if self._audio_device:
-                    print(f"[ENGINE] Using audio device override: {self._audio_device!r}")
-                    options = supriya.ServerOptions()
-                    options.device = self._audio_device
-                    server = supriya.Server(options=options).boot()
-                else:
-                    server = supriya.Server().boot()
-            except Exception as exc:
-                self._set_status("error", f"Server boot failed: {exc}")
-                return
+                cmd = self._command_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
-            print("[ENGINE] Supriya server booted:", server)
-            self._server = server
-            self._set_status("running")
+            if not cmd:
+                continue
 
-            # Install SynthDef and sync (pre-load our voice definition)
-            server.add_synthdefs(peppermint_voice)
-            server.sync()
+            kind = cmd[0]
 
-            # Group that contains all voices
-            self._synth_group = server.add_group()
-
-            # Initialize global params (must match SynthDef defaults)
-            self._global_params = {
-                "vco_mix": 0.5,
-                "vco1_wave": 0.0,
-                "vco2_wave": 0.0,
-                "detune": 1.01,
-                "cutoff": 1200.0,
-                "res": 0.2,
-                "env_amt": 0.5,
-                "noise_mix": 0.0,
-                "lfo_freq": 5.0,
-                "lfo_depth": 0.0,
-                "lfo_target": 0.0,
-                "atk": 0.01,
-                "dec": 0.1,
-                "sus": 0.7,
-                "rel": 0.3,
-                "amp": 0.3,
-            }
-
-            reboot_requested = False
-
-            # Main command loop
-            while self._running and not reboot_requested:
-                try:
-                    cmd = self._command_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                if not cmd:
-                    continue
-
-                kind = cmd[0]
-
-                if kind == "shutdown":
-                    self._running = False
-                    break
-                elif kind == "reboot":
-                    # Gracefully stop audio engine and restart outer loop
-                    reboot_requested = True
-                    print("[ENGINE] Reboot requested from GUI.")
-                    continue
-                elif kind == "set_audio_device":
-                    device = cmd[1]
-                    self._audio_device = device if device else None
-                    print(f"[ENGINE] Audio device set to: {self._audio_device!r}")
-                elif kind == "set_poly_mode":
-                    self._poly_mode = bool(cmd[1])
-                elif kind == "set_param":
-                    name, value = cmd[1], cmd[2]
-                    self._handle_set_param(name, value)
-                elif kind == "note_on":
-                    midi_note, velocity = cmd[1], cmd[2]
-                    self._handle_note_on(midi_note, velocity)
-                elif kind == "note_off":
-                    midi_note = cmd[1]
-                    self._handle_note_off(midi_note)
-                elif kind == "note_off_all":
-                    self._handle_note_off_all()
-
-            # Cleanup on exit / reboot
-            self._handle_note_off_all()
-
-            try:
-                if self._synth_group is not None:
-                    self._synth_group.free()
-            except Exception:
-                pass
-
-            try:
-                if server is not None:
-                    server.quit()
-            except Exception:
-                pass
-
-            self._server = None
-            self._synth_group = None
-            self._set_status("stopped")
-            print("[ENGINE] Worker iteration exiting; server stopped.")
-
-            # If we're no longer running, break out of outer loop
-            if not self._running:
+            if kind == "shutdown":
                 break
-            # Otherwise, outer while will boot again (for reboot)
+            elif kind == "reboot":
+                # In-place audio reboot: stop voices, tear down server,
+                # re-boot with current device override and re-create group/params.
+                self._boot_server_locked()
+            elif kind == "set_poly_mode":
+                self._poly_mode = bool(cmd[1])
+            elif kind == "set_param":
+                name, value = cmd[1], cmd[2]
+                self._handle_set_param(name, value)
+            elif kind == "note_on":
+                midi_note, velocity = cmd[1], cmd[2]
+                self._handle_note_on(midi_note, velocity)
+            elif kind == "note_off":
+                midi_note = cmd[1]
+                self._handle_note_off(midi_note)
+            elif kind == "note_off_all":
+                self._handle_note_off_all()
 
-    # ------------------------------------------------------------------
-    # Internal handlers (audio thread only)
-    # ------------------------------------------------------------------
+        # Cleanup on exit
+        self._handle_note_off_all()
+
+        try:
+            if self._synth_group is not None:
+                self._synth_group.free()
+        except Exception:
+            pass
+
+        try:
+            if self._server is not None:
+                self._server.quit()
+        except Exception:
+            pass
+
+    # ---------------- Internal handlers (audio thread only) ----------------
 
     def _handle_set_param(self, name: str, value: float) -> None:
         # Ignore unknown param names
@@ -417,23 +453,23 @@ class PeppermintSynthEngine:
 
         # Propagate to any active voices
         if self._mono_voice is not None:
-            if not self._safe_set(self._mono_voice, **{name: value}):
-                self._mono_voice = None
+            try:
+                self._mono_voice.set(**{name: value})
+            except Exception:
+                pass
 
-        # Copy list to avoid mutation during iteration
-        for midi_note, voice in list(self._poly_voices.items()):
-            if not self._safe_set(voice, **{name: value}):
-                # Voice likely freed, drop from dict
-                self._poly_voices.pop(midi_note, None)
+        for voice in list(self._poly_voices.values()):
+            try:
+                voice.set(**{name: value})
+            except Exception:
+                pass
 
     def _handle_note_on(self, midi_note: int, velocity: int) -> None:
         if self._server is None or self._synth_group is None:
             return
 
-        print(f"[ENGINE] note_on: midi_note={midi_note}, velocity={velocity}")
-
         frequency = self._midi_to_hz(midi_note)
-        base_amp = self._global_params.get("amp", 0.3)
+        base_amp = self._global_params.get("amp", 0.2)
         amp = max(0.0, min(1.0, velocity / 127.0)) * base_amp
 
         if self._poly_mode:
@@ -455,41 +491,39 @@ class PeppermintSynthEngine:
                     **controls,
                 )
             else:
-                if not self._safe_set(self._mono_voice, frequency=frequency, amp=amp, gate=1.0):
-                    # If set failed, re-create mono voice
-                    controls = dict(self._global_params)
-                    controls.update({"frequency": frequency, "amp": amp, "gate": 1.0})
-                    self._mono_voice = self._synth_group.add_synth(
-                        synthdef=peppermint_voice,
-                        **controls,
-                    )
+                try:
+                    self._mono_voice.set(frequency=frequency, amp=amp, gate=1.0)
+                except Exception:
+                    pass
 
     def _handle_note_off(self, midi_note: int) -> None:
         if self._poly_mode:
             voice = self._poly_voices.pop(midi_note, None)
             if voice is not None:
-                if not self._safe_set(voice, gate=0.0):
-                    # Already freed; ignore
+                try:
+                    voice.set(gate=0.0)
+                except Exception:
                     pass
         else:
             if self._mono_voice is not None:
-                if self._safe_set(self._mono_voice, gate=0.0):
-                    # After gate=0, EnvGen.done_action=2 frees the node,
-                    # so we drop our reference to avoid later /n_set spam.
-                    self._mono_voice = None
-                else:
-                    self._mono_voice = None
+                try:
+                    self._mono_voice.set(gate=0.0)
+                except Exception:
+                    pass
 
     def _handle_note_off_all(self) -> None:
         # Kill all polyphonic voices
         for midi_note, voice in list(self._poly_voices.items()):
-            if self._safe_set(voice, gate=0.0):
+            try:
+                voice.set(gate=0.0)
+            except Exception:
                 pass
         self._poly_voices.clear()
 
         # Kill mono voice
         if self._mono_voice is not None:
-            if self._safe_set(self._mono_voice, gate=0.0):
+            try:
+                self._mono_voice.set(gate=0.0)
+            except Exception:
                 pass
             self._mono_voice = None
-
