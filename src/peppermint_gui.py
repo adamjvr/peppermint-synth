@@ -15,17 +15,13 @@ PyQt6 GUI for "Peppermint Synth - Roth Amplification Ltd."
 
 from __future__ import annotations
 
+import subprocess
 from typing import Dict
 
 from PyQt6 import QtCore, QtWidgets
 
 from peppermint_engine import PeppermintSynthEngine
 from peppermint_midi import MidiInputManager
-from peppermint_jack_routing import (
-    list_supercollider_output_ports,
-    list_playback_ports,
-    connect_stereo_pair,
-)
 from peppermint_piano import PianoWidget
 from peppermint_presets import SynthPresetManager
 
@@ -97,9 +93,8 @@ class ParameterSlider(QtWidgets.QWidget):
         self._base_label_text = label_text
 
         self.set_value(default, emit=False)
-        self.slider.valueChanged.connect(self._on_slider_changed)
 
-    # ---------------- value helpers ----------------
+        self.slider.valueChanged.connect(self._on_slider_changed)
 
     def _slider_to_value(self, pos: int) -> float:
         norm = pos / 1000.0
@@ -110,22 +105,21 @@ class ParameterSlider(QtWidgets.QWidget):
         norm = (clamped - self.min_val) / (self.max_val - self.min_val)
         return int(norm * 1000)
 
-    # ---------------- public API ----------------
-
     def set_value(self, value: float, emit: bool = True) -> None:
         pos = self._value_to_slider(value)
+
         self.slider.blockSignals(True)
         self.slider.setValue(pos)
         self.slider.blockSignals(False)
+
         actual = self._slider_to_value(pos)
         self.label.setText(f"{self._base_label_text}\n{actual:.3f}")
+
         if emit:
             self.valueChanged.emit(self.param_name, actual)
 
     def get_value(self) -> float:
         return self._slider_to_value(self.slider.value())
-
-    # ---------------- internal slot ----------------
 
     def _on_slider_changed(self, pos: int) -> None:
         value = self._slider_to_value(pos)
@@ -142,47 +136,20 @@ class SynthControlWindow(QtWidgets.QWidget):
         super().__init__(parent)
 
         self.engine = engine
-
-        # Title you asked for:
         self.setWindowTitle("Peppermint Synth - Roth Amplification Ltd.")
         self.setStyleSheet("background-color: white; color: black;")
 
         self.param_sliders: Dict[str, ParameterSlider] = {}
-
         self.midi_manager: MidiInputManager | None = None
         self.preset_manager = SynthPresetManager()
 
         self._build_ui()
         self._setup_midi()
-        # Poll SuperCollider server status periodically so we can reflect
-        # it in the GUI label without tight coupling.
+
         self._sc_status_timer = QtCore.QTimer(self)
-        self._sc_status_timer.setInterval(500)  # 2x per second
+        self._sc_status_timer.setInterval(500)
         self._sc_status_timer.timeout.connect(self._poll_sc_status)
         self._sc_status_timer.start()
-
-
-    def _poll_sc_status(self) -> None:
-        """Update the SC status label based on engine.is_server_running()."""
-        label = getattr(self, "sc_status_label", None)
-        if label is None:
-            return
-        running = False
-        try:
-            running = bool(self.engine.is_server_running())
-        except Exception:
-            running = False
-
-        if running:
-            label.setText("SC: running")
-            label.setStyleSheet("color: green; font-weight: bold;")
-        else:
-            label.setText("SC: stopped")
-            label.setStyleSheet("color: red; font-weight: bold;")
-
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         main_layout = QtWidgets.QVBoxLayout()
@@ -190,31 +157,25 @@ class SynthControlWindow(QtWidgets.QWidget):
         main_layout.setSpacing(10)
         self.setLayout(main_layout)
 
-        # ---------- Row 1: mode + LFO target + note ----------
+        # ---------- Row 1 ----------
         top_layout = QtWidgets.QHBoxLayout()
 
-        # Poly/mono
         mode_lbl = QtWidgets.QLabel("Mode:")
         mode_lbl.setStyleSheet("color: black;")
-
         self.poly_mode_combo = QtWidgets.QComboBox()
         self.poly_mode_combo.addItem("Mono", False)
         self.poly_mode_combo.addItem("Poly", True)
         self.poly_mode_combo.currentIndexChanged.connect(self._on_poly_mode_changed)
 
-        # LFO target
         lfo_lbl = QtWidgets.QLabel("LFO Target:")
         lfo_lbl.setStyleSheet("color: black;")
-
         self.lfo_target_combo = QtWidgets.QComboBox()
         self.lfo_target_combo.addItem("LFO → Pitch", 0.0)
         self.lfo_target_combo.addItem("LFO → Filter", 1.0)
         self.lfo_target_combo.currentIndexChanged.connect(self._on_lfo_target_changed)
 
-        # Simple note drop-down + buttons
         note_lbl = QtWidgets.QLabel("Note:")
         note_lbl.setStyleSheet("color: black;")
-
         self.note_combo = QtWidgets.QComboBox()
         self.note_combo.addItem("A2 (110 Hz)", 45)
         self.note_combo.addItem("A3 (220 Hz)", 57)
@@ -225,10 +186,6 @@ class SynthControlWindow(QtWidgets.QWidget):
         self.note_off_button = QtWidgets.QPushButton("Note Off")
         self.note_on_button.clicked.connect(self._on_note_on_button)
         self.note_off_button.clicked.connect(self._on_note_off_button)
-
-        # SuperCollider status label (updated via timer)
-        self.sc_status_label = QtWidgets.QLabel("SC: unknown")
-        self.sc_status_label.setStyleSheet("color: black; font-weight: bold;")
 
         top_layout.addWidget(mode_lbl)
         top_layout.addWidget(self.poly_mode_combo)
@@ -241,16 +198,18 @@ class SynthControlWindow(QtWidgets.QWidget):
         top_layout.addWidget(self.note_on_button)
         top_layout.addWidget(self.note_off_button)
         top_layout.addSpacing(20)
+
+        self.sc_status_label = QtWidgets.QLabel("SC: unknown")
+        self.sc_status_label.setStyleSheet("color: black; font-weight: bold;")
         top_layout.addWidget(self.sc_status_label)
 
         main_layout.addLayout(top_layout)
 
-        # ---------- Row 2: MIDI + presets ----------
+        # ---------- Row 2 (MIDI, JACK, Reboot SC, presets) ----------
         second_layout = QtWidgets.QHBoxLayout()
 
         midi_lbl = QtWidgets.QLabel("MIDI In:")
         midi_lbl.setStyleSheet("color: black;")
-
         self.midi_port_combo = QtWidgets.QComboBox()
         self.midi_refresh_button = QtWidgets.QPushButton("Refresh MIDI")
         self.midi_refresh_button.clicked.connect(self._on_midi_refresh)
@@ -261,45 +220,32 @@ class SynthControlWindow(QtWidgets.QWidget):
         self.save_preset_button.clicked.connect(self._on_save_preset)
         self.load_preset_button.clicked.connect(self._on_load_preset)
 
-        # SuperCollider audio device controls
-        device_lbl = QtWidgets.QLabel("SC Device:")
-        device_lbl.setStyleSheet("color: black;")
-        self.audio_device_edit = QtWidgets.QLineEdit()
-        self.audio_device_edit.setPlaceholderText(
-            "e.g. PipeWire or hw:0,0 (blank = default)"
-        )
-
-        self.reboot_audio_button = QtWidgets.QPushButton("Reboot Audio")
-        self.reboot_audio_button.clicked.connect(self._on_reboot_audio)
-
-        self.jack_routing_button = QtWidgets.QPushButton("JACK Routing…")
-        self.jack_routing_button.clicked.connect(self._on_open_jack_routing)
-
         second_layout.addWidget(midi_lbl)
         second_layout.addWidget(self.midi_port_combo)
         second_layout.addWidget(self.midi_refresh_button)
         second_layout.addStretch(1)
+
+        # JACK routing helper dialog
+        self.jack_button = QtWidgets.QPushButton("JACK Routing…")
+        self.jack_button.clicked.connect(self._on_open_jack_routing)
+        second_layout.addWidget(self.jack_button)
+
+        # Explicit SuperCollider reboot control
+        self.reboot_sc_button = QtWidgets.QPushButton("Reboot SC")
+        self.reboot_sc_button.clicked.connect(self._on_reboot_sc_clicked)
+        second_layout.addWidget(self.reboot_sc_button)
+
         second_layout.addWidget(self.save_preset_button)
         second_layout.addWidget(self.load_preset_button)
-        second_layout.addSpacing(20)
-        second_layout.addWidget(device_lbl)
-        second_layout.addWidget(self.audio_device_edit)
-        second_layout.addWidget(self.reboot_audio_button)
-        second_layout.addWidget(self.jack_routing_button)
 
         main_layout.addLayout(second_layout)
 
-        # ---------- Middle: parameter banks in horizontal columns ----------
+        # ---------- Parameter banks ----------
         panel_layout = QtWidgets.QHBoxLayout()
         panel_layout.setSpacing(30)
         main_layout.addLayout(panel_layout)
 
         def create_centered_bank(title: str):
-            """
-            Create:
-                [TITLE]
-                [  sliders horizontally centered  ]
-            """
             bank_layout = QtWidgets.QVBoxLayout()
             bank_layout.setSpacing(4)
 
@@ -333,7 +279,7 @@ class SynthControlWindow(QtWidgets.QWidget):
             self.param_sliders[param] = slider
             row_layout.addWidget(slider)
 
-        # Column 1: VCO + FILTER stacked
+        # Column 1: VCO + FILTER
         col_vco_filt = QtWidgets.QVBoxLayout()
         col_vco_filt.setSpacing(12)
 
@@ -395,16 +341,12 @@ class SynthControlWindow(QtWidgets.QWidget):
         panel_layout.addLayout(col_amp)
         panel_layout.addStretch(1)
 
-        # ---------- Bottom: piano ----------
+        # Piano
         self.piano_widget = PianoWidget(
             note_on_cb=self._on_piano_note_on,
             note_off_cb=self._on_piano_note_off,
         )
         main_layout.addWidget(self.piano_widget)
-
-    # ------------------------------------------------------------------
-    # MIDI setup
-    # ------------------------------------------------------------------
 
     def _setup_midi(self) -> None:
         self.midi_manager = MidiInputManager(
@@ -417,20 +359,30 @@ class SynthControlWindow(QtWidgets.QWidget):
     def _populate_midi_ports(self) -> None:
         if self.midi_manager is None:
             return
+
         ports = self.midi_manager.list_input_ports()
         current = self.midi_manager.current_port_name
 
         self.midi_port_combo.blockSignals(True)
         self.midi_port_combo.clear()
+
         for name in ports:
             self.midi_port_combo.addItem(name, name)
+
         if current and current in ports:
             self.midi_port_combo.setCurrentIndex(ports.index(current))
+
         self.midi_port_combo.blockSignals(False)
 
-    # ------------------------------------------------------------------
-    # Event handlers
-    # ------------------------------------------------------------------
+    def _poll_sc_status(self) -> None:
+        if self.engine.is_server_running():
+            self.sc_status_label.setText("SC: running")
+            self.sc_status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.sc_status_label.setText("SC: stopped")
+            self.sc_status_label.setStyleSheet("color: red; font-weight: bold;")
+
+    # ----- event handlers -----
 
     def _on_poly_mode_changed(self) -> None:
         is_poly = bool(self.poly_mode_combo.currentData())
@@ -438,7 +390,6 @@ class SynthControlWindow(QtWidgets.QWidget):
 
     def _on_lfo_target_changed(self) -> None:
         value = float(self.lfo_target_combo.currentData())
-        # lfo_target is a SynthDef control (0.0 or 1.0)
         self.engine.set_param("lfo_target", value)
 
     def _on_param_slider_changed(self, param_name: str, value: float) -> None:
@@ -447,12 +398,9 @@ class SynthControlWindow(QtWidgets.QWidget):
     def _on_note_on_button(self) -> None:
         midi_note = int(self.note_combo.currentData())
         self.engine.note_on(midi_note, velocity=100)
-        # Ensure engine has latest params (GUI might have changed before)
         for name, slider in self.param_sliders.items():
             self.engine.set_param(name, slider.get_value())
-        self.engine.set_param(
-            "lfo_target", float(self.lfo_target_combo.currentData())
-        )
+        self.engine.set_param("lfo_target", float(self.lfo_target_combo.currentData()))
 
     def _on_note_off_button(self) -> None:
         self.engine.note_off_all()
@@ -461,9 +409,7 @@ class SynthControlWindow(QtWidgets.QWidget):
         self.engine.note_on(midi_note, velocity=100)
         for name, slider in self.param_sliders.items():
             self.engine.set_param(name, slider.get_value())
-        self.engine.set_param(
-            "lfo_target", float(self.lfo_target_combo.currentData())
-        )
+        self.engine.set_param("lfo_target", float(self.lfo_target_combo.currentData()))
 
     def _on_piano_note_off(self, midi_note: int) -> None:
         self.engine.note_off(midi_note)
@@ -477,8 +423,6 @@ class SynthControlWindow(QtWidgets.QWidget):
         name = self.midi_port_combo.currentData()
         if name:
             self.midi_manager.open_port_by_name(str(name))
-
-    # ---------- Presets ----------
 
     def _on_save_preset(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -514,38 +458,11 @@ class SynthControlWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Error Loading Preset", str(exc))
             return
 
-    # ---------- Audio device + JACK helpers ----------
-
-    def _on_reboot_audio(self) -> None:
-        """Called when the user clicks the 'Reboot Audio' button."""
-        device_text = ""
-        if hasattr(self, "audio_device_edit") and self.audio_device_edit is not None:
-            device_text = self.audio_device_edit.text().strip()
-
-        # Tell the engine about the new device override (may be empty).
-        try:
-            self.engine.set_audio_device(device_text if device_text else None)
-        except Exception as exc:
-            print(f"[GUI] set_audio_device failed: {exc}")
-
-        # Request a reboot; engine will handle in its worker thread.
-        try:
-            self.engine.reboot_audio()
-        except Exception as exc:
-            print(f"[GUI] reboot_audio failed: {exc}")
-
-    def _on_open_jack_routing(self) -> None:
-        """Open the JACK / PipeWire routing helper dialog."""
-        dlg = JackRoutingDialog(self)
-        dlg.exec()
-
-
         poly_mode = bool(preset.get("poly_mode", False))
         self.poly_mode_combo.setCurrentIndex(1 if poly_mode else 0)
         self.engine.set_poly_mode(poly_mode)
 
         lfo_target = float(preset.get("lfo_target", 0.0))
-        # find matching index
         idx = 0 if lfo_target < 0.5 else 1
         self.lfo_target_combo.setCurrentIndex(idx)
         self.engine.set_param("lfo_target", lfo_target)
@@ -560,16 +477,32 @@ class SynthControlWindow(QtWidgets.QWidget):
                 self.midi_manager.open_port_by_name(midi_port)
             self._populate_midi_ports()
 
-        # Restore sliders
         for name, value in preset.get("sliders", {}).items():
             slider = self.param_sliders.get(name)
             if slider is not None:
                 slider.set_value(float(value), emit=False)
                 self.engine.set_param(name, float(value))
 
-    # ------------------------------------------------------------------
-    # Clean shutdown hook
-    # ------------------------------------------------------------------
+    # ----- JACK + Reboot SC -----
+
+    def _on_open_jack_routing(self) -> None:
+        """Open the JACK routing helper dialog."""
+        dlg = JackRoutingDialog(self)
+        dlg.exec()
+
+    def _on_reboot_sc_clicked(self) -> None:
+        """Request a SuperCollider server reboot from the engine.
+
+        This stops any currently held notes, asks the engine to reboot
+        the Supriya server on its audio thread, and gives the user
+        immediate visual feedback in the status label.
+        """
+        self.engine.note_off_all()
+        self.sc_status_label.setText("SC: rebooting…")
+        self.sc_status_label.setStyleSheet("color: orange; font-weight: bold;")
+        self.engine.reboot_server()
+
+    # ----- Clean shutdown -----
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self.midi_manager is not None:
@@ -578,151 +511,121 @@ class SynthControlWindow(QtWidgets.QWidget):
         super().closeEvent(event)
 
 
-
 class JackRoutingDialog(QtWidgets.QDialog):
-    """Simple helper dialog for JACK / PipeWire routing.
+    """Utility dialog to wire SuperCollider → system playback via JACK/PipeWire."""
 
-    It shells out to `jack_lsp` and `jack_connect` via the helper functions
-    in peppermint_jack_routing.py to connect SuperCollider's output ports
-    to system playback (or any other sink).
-    """
-
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("JACK / PipeWire Routing")
-        self.resize(700, 400)
+        self.setWindowTitle("JACK Routing - Peppermint Synth")
+        self.resize(640, 400)
 
         layout = QtWidgets.QVBoxLayout(self)
 
-        # Instructions
-        info = QtWidgets.QLabel(
-            "Select two SuperCollider outputs and two playback ports, then\n"
-            "press 'Connect L/R' to wire them together via jack_connect."
+        desc = QtWidgets.QLabel(
+            "Select up to two SuperCollider output ports and two playback ports,\n"
+            "then click 'Connect L/R' to wire them together."
         )
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
 
         lists_layout = QtWidgets.QHBoxLayout()
         layout.addLayout(lists_layout)
 
-        # SuperCollider outputs list
-        sc_layout = QtWidgets.QVBoxLayout()
-        lists_layout.addLayout(sc_layout)
-
-        sc_label = QtWidgets.QLabel("SuperCollider outputs:")
-        sc_layout.addWidget(sc_label)
-
         self.sc_list = QtWidgets.QListWidget()
-        self.sc_list.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
-        )
-        sc_layout.addWidget(self.sc_list)
+        self.sc_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.sc_list.setMinimumWidth(260)
+        lists_layout.addWidget(self.sc_list)
 
-        # Playback ports list
-        pb_layout = QtWidgets.QVBoxLayout()
-        lists_layout.addLayout(pb_layout)
+        self.playback_list = QtWidgets.QListWidget()
+        self.playback_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.playback_list.setMinimumWidth(260)
+        lists_layout.addWidget(self.playback_list)
 
-        pb_label = QtWidgets.QLabel("Playback / sink ports:")
-        pb_layout.addWidget(pb_label)
-
-        self.pb_list = QtWidgets.QListWidget()
-        self.pb_list.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
-        )
-        pb_layout.addWidget(self.pb_list)
-
-        # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
         layout.addLayout(btn_layout)
-
-        self.refresh_button = QtWidgets.QPushButton("Refresh Ports")
-        self.refresh_button.clicked.connect(self._refresh_ports)
-        btn_layout.addWidget(self.refresh_button)
-
-        self.connect_button = QtWidgets.QPushButton("Connect L/R")
-        self.connect_button.clicked.connect(self._connect_lr)
-        btn_layout.addWidget(self.connect_button)
-
         btn_layout.addStretch(1)
 
-        self.close_button = QtWidgets.QPushButton("Close")
-        self.close_button.clicked.connect(self.accept)
-        btn_layout.addWidget(self.close_button)
+        refresh_btn = QtWidgets.QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh_ports)
+        btn_layout.addWidget(refresh_btn)
 
-        # Initial population
+        connect_btn = QtWidgets.QPushButton("Connect L/R")
+        connect_btn.clicked.connect(self._on_connect)
+        btn_layout.addWidget(connect_btn)
+
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+
         self._refresh_ports()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def _run_jack_lsp(self) -> list[str]:
+        try:
+            proc = subprocess.run(
+                ["jack_lsp"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            return []
+        if proc.returncode != 0:
+            return []
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
     def _refresh_ports(self) -> None:
-        """Refresh the JACK port lists using jack_lsp via helpers."""
+        ports = self._run_jack_lsp()
+        sc_ports = [p for p in ports if "SuperCollider" in p or "supercollider" in p]
+        playback_ports = [p for p in ports if "playback" in p or "system" in p]
+
         self.sc_list.clear()
-        self.pb_list.clear()
+        self.playback_list.clear()
 
-        try:
-            sc_ports = list_supercollider_output_ports()
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "JACK Error",
-                f"Failed to list SuperCollider ports via jack_lsp:\n{exc}",
-            )
-            sc_ports = []
+        for p in sc_ports:
+            self.sc_list.addItem(p)
+        for p in playback_ports:
+            self.playback_list.addItem(p)
 
-        try:
-            pb_ports = list_playback_ports()
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "JACK Error",
-                f"Failed to list playback ports via jack_lsp:\n{exc}",
-            )
-            pb_ports = []
-
-        for name in sc_ports:
-            self.sc_list.addItem(name)
-        for name in pb_ports:
-            self.pb_list.addItem(name)
-
-    def _connect_lr(self) -> None:
-        """Connect selected SC outputs to selected playback ports as L/R."""
+    def _on_connect(self) -> None:
         sc_selected = [i.text() for i in self.sc_list.selectedItems()]
-        pb_selected = [i.text() for i in self.pb_list.selectedItems()]
+        pb_selected = [i.text() for i in self.playback_list.selectedItems()]
 
         if len(sc_selected) < 2 or len(pb_selected) < 2:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Selection Required",
-                "Please select at least two SC outputs and two playback ports.",
-            )
-            return
-
-        sc_left, sc_right = sc_selected[0], sc_selected[1]
-        pb_left, pb_right = pb_selected[0], pb_selected[1]
-
-        try:
-            ok_left, msg_left = connect_stereo_pair(
-                sc_left, sc_right, pb_left, pb_right
-            )
-        except Exception as exc:
             QtWidgets.QMessageBox.warning(
                 self,
-                "JACK Error",
-                f"Error while calling jack_connect:\n{exc}",
+                "Selection Error",
+                "Please select at least two SuperCollider outputs and two playback ports.",
             )
             return
 
-        if ok_left:
+        sc_l, sc_r = sc_selected[0], sc_selected[1]
+        pb_l, pb_r = pb_selected[0], pb_selected[1]
+
+        def _jack_connect(a: str, b: str) -> bool:
+            try:
+                proc = subprocess.run(
+                    ["jack_connect", a, b],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                return False
+            return proc.returncode == 0
+
+        ok_l = _jack_connect(sc_l, pb_l)
+        ok_r = _jack_connect(sc_r, pb_r)
+
+        if ok_l and ok_r:
             QtWidgets.QMessageBox.information(
                 self,
-                "JACK Routing",
-                f"Connected:\n  {sc_left} → {pb_left}\n  {sc_right} → {pb_right}",
+                "Connected",
+                f"Connected\n  {sc_l} → {pb_l}\n  {sc_r} → {pb_r}",
             )
         else:
             QtWidgets.QMessageBox.warning(
                 self,
-                "JACK Routing",
-                f"Routing failed:\n{msg_left}",
+                "Connection Error",
+                "Failed to connect one or more JACK ports.\n"
+                "Check 'jack_lsp' and 'jack_connect' on your system.",
             )
