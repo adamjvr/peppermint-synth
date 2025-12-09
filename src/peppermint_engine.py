@@ -180,7 +180,10 @@ class PeppermintSynthEngine:
         self._last_error: str = ""
         self._status_lock = threading.Lock()
 
-        # Supriya server and group, only used on worker thread
+                # Selected audio device name (None = default)
+        self._audio_device: Optional[str] = None
+
+# Supriya server and group, only used on worker thread
         self._server: Optional[supriya.Server] = None
         self._synth_group = None
 
@@ -221,6 +224,16 @@ class PeppermintSynthEngine:
     # ------------------------------------------------------------------
     # Public API (GUI / MIDI thread)
     # ------------------------------------------------------------------
+
+    def set_audio_device(self, device: Optional[str]) -> None:
+        """Request a change to the SuperCollider audio device.
+        Pass None or an empty string to use the default device.
+        """
+        self._command_queue.put(("set_audio_device", device))
+
+    def reboot_audio(self) -> None:
+        """Request a reboot of the audio engine with current settings."""
+        self._command_queue.put(("reboot",))
 
     def set_poly_mode(self, is_poly: bool) -> None:
         self._command_queue.put(("set_poly_mode", bool(is_poly)))
@@ -273,94 +286,123 @@ class PeppermintSynthEngine:
     # ------------------------------------------------------------------
 
     def _thread_main(self) -> None:
-        """Boot server, install SynthDef, process commands until shutdown."""
+        """Boot server, install SynthDef, process commands; support reboot and
+        configurable audio device via self._audio_device.
+        """
 
-        self._set_status("booting")
-        print("[ENGINE] Worker thread starting, booting Supriya server...")
-
-        # Boot Supriya server (use default options for now)
-        try:
-            server = supriya.Server().boot()
-        except Exception as exc:
-            self._set_status("error", f"Server boot failed: {exc}")
-            return
-
-        print("[ENGINE] Supriya server booted:", server)
-        self._server = server
-        self._set_status("running")
-
-        # Install SynthDef and sync (pre-load our voice definition)
-        server.add_synthdefs(peppermint_voice)
-        server.sync()
-
-        # Group that contains all voices
-        self._synth_group = server.add_group()
-
-        # Initialize global params (must match SynthDef defaults)
-        self._global_params = {
-            "vco_mix": 0.5,
-            "vco1_wave": 0.0,
-            "vco2_wave": 0.0,
-            "detune": 1.01,
-            "cutoff": 1200.0,
-            "res": 0.2,
-            "env_amt": 0.5,
-            "noise_mix": 0.0,
-            "lfo_freq": 5.0,
-            "lfo_depth": 0.0,
-            "lfo_target": 0.0,
-            "atk": 0.01,
-            "dec": 0.1,
-            "sus": 0.7,
-            "rel": 0.3,
-            "amp": 0.3,
-        }
-
-        # Main command loop
         while self._running:
+            self._set_status("booting")
+            print("[ENGINE] Worker thread starting, booting Supriya server...")
+
+            # Prepare Supriya server options (honor audio device override if set)
+            server = None
             try:
-                cmd = self._command_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+                if self._audio_device:
+                    print(f"[ENGINE] Using audio device override: {self._audio_device!r}")
+                    options = supriya.ServerOptions()
+                    options.device = self._audio_device
+                    server = supriya.Server(options=options).boot()
+                else:
+                    server = supriya.Server().boot()
+            except Exception as exc:
+                self._set_status("error", f"Server boot failed: {exc}")
+                return
 
-            if not cmd:
-                continue
+            print("[ENGINE] Supriya server booted:", server)
+            self._server = server
+            self._set_status("running")
 
-            kind = cmd[0]
+            # Install SynthDef and sync (pre-load our voice definition)
+            server.add_synthdefs(peppermint_voice)
+            server.sync()
 
-            if kind == "shutdown":
+            # Group that contains all voices
+            self._synth_group = server.add_group()
+
+            # Initialize global params (must match SynthDef defaults)
+            self._global_params = {
+                "vco_mix": 0.5,
+                "vco1_wave": 0.0,
+                "vco2_wave": 0.0,
+                "detune": 1.01,
+                "cutoff": 1200.0,
+                "res": 0.2,
+                "env_amt": 0.5,
+                "noise_mix": 0.0,
+                "lfo_freq": 5.0,
+                "lfo_depth": 0.0,
+                "lfo_target": 0.0,
+                "atk": 0.01,
+                "dec": 0.1,
+                "sus": 0.7,
+                "rel": 0.3,
+                "amp": 0.3,
+            }
+
+            reboot_requested = False
+
+            # Main command loop
+            while self._running and not reboot_requested:
+                try:
+                    cmd = self._command_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                if not cmd:
+                    continue
+
+                kind = cmd[0]
+
+                if kind == "shutdown":
+                    self._running = False
+                    break
+                elif kind == "reboot":
+                    # Gracefully stop audio engine and restart outer loop
+                    reboot_requested = True
+                    print("[ENGINE] Reboot requested from GUI.")
+                    continue
+                elif kind == "set_audio_device":
+                    device = cmd[1]
+                    self._audio_device = device if device else None
+                    print(f"[ENGINE] Audio device set to: {self._audio_device!r}")
+                elif kind == "set_poly_mode":
+                    self._poly_mode = bool(cmd[1])
+                elif kind == "set_param":
+                    name, value = cmd[1], cmd[2]
+                    self._handle_set_param(name, value)
+                elif kind == "note_on":
+                    midi_note, velocity = cmd[1], cmd[2]
+                    self._handle_note_on(midi_note, velocity)
+                elif kind == "note_off":
+                    midi_note = cmd[1]
+                    self._handle_note_off(midi_note)
+                elif kind == "note_off_all":
+                    self._handle_note_off_all()
+
+            # Cleanup on exit / reboot
+            self._handle_note_off_all()
+
+            try:
+                if self._synth_group is not None:
+                    self._synth_group.free()
+            except Exception:
+                pass
+
+            try:
+                if server is not None:
+                    server.quit()
+            except Exception:
+                pass
+
+            self._server = None
+            self._synth_group = None
+            self._set_status("stopped")
+            print("[ENGINE] Worker iteration exiting; server stopped.")
+
+            # If we're no longer running, break out of outer loop
+            if not self._running:
                 break
-            elif kind == "set_poly_mode":
-                self._poly_mode = bool(cmd[1])
-            elif kind == "set_param":
-                name, value = cmd[1], cmd[2]
-                self._handle_set_param(name, value)
-            elif kind == "note_on":
-                midi_note, velocity = cmd[1], cmd[2]
-                self._handle_note_on(midi_note, velocity)
-            elif kind == "note_off":
-                midi_note = cmd[1]
-                self._handle_note_off(midi_note)
-            elif kind == "note_off_all":
-                self._handle_note_off_all()
-
-        # Cleanup on exit
-        self._handle_note_off_all()
-
-        try:
-            if self._synth_group is not None:
-                self._synth_group.free()
-        except Exception:
-            pass
-
-        try:
-            if server is not None:
-                server.quit()
-        except Exception:
-            pass
-
-        self._set_status("stopped")
-        print("[ENGINE] Worker thread exiting; server stopped.")
+            # Otherwise, outer while will boot again (for reboot)
 
     # ------------------------------------------------------------------
     # Internal handlers (audio thread only)

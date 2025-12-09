@@ -20,6 +20,7 @@ from typing import Dict
 from PyQt6 import QtCore, QtWidgets
 
 from peppermint_engine import PeppermintSynthEngine
+from peppermint_audio_devices import list_alsa_devices
 from peppermint_midi import MidiInputManager
 from peppermint_piano import PianoWidget
 from peppermint_presets import SynthPresetManager
@@ -242,6 +243,31 @@ class SynthControlWindow(QtWidgets.QWidget):
         second_layout.addWidget(self.midi_port_combo)
         second_layout.addWidget(self.midi_refresh_button)
         second_layout.addStretch(1)
+        # SuperCollider audio device + reboot controls
+        audio_lbl = QtWidgets.QLabel("SC Audio Device:")
+        audio_lbl.setStyleSheet("color: black;")
+        # Combo box populated from ALSA via `aplay -l` (peppermint_audio_devices)
+        self.audio_device_combo = QtWidgets.QComboBox()
+        self.audio_device_combo.addItem("Default (SuperCollider)", "")
+        try:
+            for dev_name, desc in list_alsa_devices():
+                label = f"{dev_name}  —  {desc}"
+                self.audio_device_combo.addItem(label, dev_name)
+        except Exception as exc:
+            self.audio_device_combo.addItem(f"(device scan error: {exc})", "")
+        self.audio_device_combo.currentIndexChanged.connect(self._on_audio_device_combo_changed)
+        # Manual override text box (optional)
+        self.audio_device_edit = QtWidgets.QLineEdit()
+        self.audio_device_edit.setPlaceholderText("leave blank for default")
+        self.reboot_audio_button = QtWidgets.QPushButton("Reboot Audio")
+        self.reboot_audio_button.clicked.connect(self._on_reboot_audio)
+
+        second_layout.addStretch(1)
+        second_layout.addWidget(audio_lbl)
+        second_layout.addWidget(self.audio_device_combo)
+        second_layout.addWidget(self.audio_device_edit)
+        second_layout.addWidget(self.reboot_audio_button)
+
         second_layout.addWidget(self.save_preset_button)
         second_layout.addWidget(self.load_preset_button)
 
@@ -500,7 +526,40 @@ class SynthControlWindow(QtWidgets.QWidget):
                 self.engine.set_param(name, float(value))
 
     
-    # ------------------------------------------------------------------
+    
+    def _on_reboot_audio(self) -> None:
+        """Send audio device text (if any) to engine and request reboot."""
+        text = ""
+        try:
+            text = self.audio_device_edit.text().strip()
+        except Exception:
+            # If widget missing for some reason, fail quietly
+            text = ""
+        device = text if text else None
+        try:
+            self.engine.set_audio_device(device)
+            self.engine.reboot_audio()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Audio Reboot Error",
+                f"Failed to reboot audio engine: {exc}",
+            )
+
+
+
+    def _on_audio_device_combo_changed(self, index: int) -> None:
+        """When the combo selection changes, mirror the device string into the line edit."""
+        try:
+            device = self.audio_device_combo.currentData()
+        except Exception:
+            device = ""
+        if device is None:
+            device = ""
+        self.audio_device_edit.setText(str(device))
+
+
+# ------------------------------------------------------------------
     # SuperCollider status polling
     # ------------------------------------------------------------------
 
