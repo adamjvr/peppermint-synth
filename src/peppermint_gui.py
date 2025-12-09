@@ -20,8 +20,12 @@ from typing import Dict
 from PyQt6 import QtCore, QtWidgets
 
 from peppermint_engine import PeppermintSynthEngine
-from peppermint_audio_devices import list_alsa_devices
 from peppermint_midi import MidiInputManager
+from peppermint_jack_routing import (
+    list_supercollider_output_ports,
+    list_playback_ports,
+    connect_stereo_pair,
+)
 from peppermint_piano import PianoWidget
 from peppermint_presets import SynthPresetManager
 
@@ -161,19 +165,6 @@ class SynthControlWindow(QtWidgets.QWidget):
         main_layout.setSpacing(10)
         self.setLayout(main_layout)
 
-        # SuperCollider status label (top-left)
-        self.sc_status_label = QtWidgets.QLabel("SuperCollider: initializing")
-        self.sc_status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
-        self.sc_status_label.setStyleSheet("color: black;")
-        main_layout.addWidget(self.sc_status_label)
-
-        # Timer to poll engine.get_status() and update the label
-        self._sc_status_timer = QtCore.QTimer(self)
-        self._sc_status_timer.setInterval(500)  # ms
-        self._sc_status_timer.timeout.connect(self._update_sc_status_label)
-        self._sc_status_timer.start()
-
-
         # ---------- Row 1: mode + LFO target + note ----------
         top_layout = QtWidgets.QHBoxLayout()
 
@@ -242,34 +233,23 @@ class SynthControlWindow(QtWidgets.QWidget):
         second_layout.addWidget(midi_lbl)
         second_layout.addWidget(self.midi_port_combo)
         second_layout.addWidget(self.midi_refresh_button)
-        second_layout.addStretch(1)
-        # SuperCollider audio device + reboot controls
-        audio_lbl = QtWidgets.QLabel("SC Audio Device:")
-        audio_lbl.setStyleSheet("color: black;")
-        # Combo box populated from ALSA via `aplay -l` (peppermint_audio_devices)
-        self.audio_device_combo = QtWidgets.QComboBox()
-        self.audio_device_combo.addItem("Default (SuperCollider)", "")
-        try:
-            for dev_name, desc in list_alsa_devices():
-                label = f"{dev_name}  —  {desc}"
-                self.audio_device_combo.addItem(label, dev_name)
-        except Exception as exc:
-            self.audio_device_combo.addItem(f"(device scan error: {exc})", "")
-        self.audio_device_combo.currentIndexChanged.connect(self._on_audio_device_combo_changed)
-        # Manual override text box (optional)
-        self.audio_device_edit = QtWidgets.QLineEdit()
-        self.audio_device_edit.setPlaceholderText("leave blank for default")
-        self.reboot_audio_button = QtWidgets.QPushButton("Reboot Audio")
-        self.reboot_audio_button.clicked.connect(self._on_reboot_audio)
-
-        second_layout.addStretch(1)
-        second_layout.addWidget(audio_lbl)
-        second_layout.addWidget(self.audio_device_combo)
-        second_layout.addWidget(self.audio_device_edit)
-        second_layout.addWidget(self.reboot_audio_button)
-
+        second_layout.addSpacing(20)
         second_layout.addWidget(self.save_preset_button)
         second_layout.addWidget(self.load_preset_button)
+        second_layout.addSpacing(20)
+        # SuperCollider audio device + controls
+        sc_lbl = QtWidgets.QLabel("SC Device:")
+        sc_lbl.setStyleSheet("color: black;")
+        self.audio_device_edit = QtWidgets.QLineEdit()
+        self.audio_device_edit.setPlaceholderText("e.g. hw:0,0 or PipeWire (blank = default)")
+        self.reboot_audio_button = QtWidgets.QPushButton("Reboot Audio")
+        self.reboot_audio_button.clicked.connect(self._on_reboot_audio)
+        self.jack_routing_button = QtWidgets.QPushButton("JACK Routing...")
+        self.jack_routing_button.clicked.connect(self._open_jack_routing_dialog)
+        second_layout.addWidget(sc_lbl)
+        second_layout.addWidget(self.audio_device_edit)
+        second_layout.addWidget(self.reboot_audio_button)
+        second_layout.addWidget(self.jack_routing_button)
 
         main_layout.addLayout(second_layout)
 
@@ -386,7 +366,44 @@ class SynthControlWindow(QtWidgets.QWidget):
         )
         main_layout.addWidget(self.piano_widget)
 
+    
     # ------------------------------------------------------------------
+    # SuperCollider audio control helpers
+    # ------------------------------------------------------------------
+
+    def _on_reboot_audio(self) -> None:
+        """
+        Read the SC device string from the line edit and ask the engine to
+        reboot audio with that override, if supported.
+        """
+        text = self.audio_device_edit.text().strip() if hasattr(self, "audio_device_edit") else ""
+        device = text if text else None
+
+        # Be defensive in case the engine running on the user's machine
+        # doesn't yet expose these newer methods.
+        if hasattr(self.engine, "set_audio_device"):
+            try:
+                self.engine.set_audio_device(device)
+            except Exception as exc:
+                print(f"[GUI] set_audio_device failed: {exc}")
+        else:
+            print("[GUI] Engine has no set_audio_device(...) method.")
+
+        if hasattr(self.engine, "reboot_audio"):
+            try:
+                self.engine.reboot_audio()
+            except Exception as exc:
+                print(f"[GUI] reboot_audio failed: {exc}")
+        else:
+            print("[GUI] Engine has no reboot_audio() method.")
+
+    def _open_jack_routing_dialog(self) -> None:
+        """Open a simple dialog to connect SC outputs to system playback via JACK."""
+        dlg = JackRoutingDialog(self)
+        dlg.exec()
+
+
+# ------------------------------------------------------------------
     # MIDI setup
     # ------------------------------------------------------------------
 
@@ -525,71 +542,105 @@ class SynthControlWindow(QtWidgets.QWidget):
                 slider.set_value(float(value), emit=False)
                 self.engine.set_param(name, float(value))
 
-    
-    
-    def _on_reboot_audio(self) -> None:
-        """Send audio device text (if any) to engine and request reboot."""
-        text = ""
-        try:
-            text = self.audio_device_edit.text().strip()
-        except Exception:
-            # If widget missing for some reason, fail quietly
-            text = ""
-        device = text if text else None
-        try:
-            self.engine.set_audio_device(device)
-            self.engine.reboot_audio()
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(
+
+class JackRoutingDialog(QtWidgets.QDialog):
+    """
+    Simple dialog to connect SuperCollider outputs to system playback ports
+    via JACK / PipeWire-JACK (jack_lsp + jack_connect).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("JACK / PipeWire Routing")
+        self.setModal(True)
+
+        self.sc_ports = []
+        self.playback_ports = []
+
+        self._build_ui()
+        self._refresh_ports()
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+
+        info_label = QtWidgets.QLabel(
+            "Select SuperCollider output ports and system playback ports.\n"
+            "Then click 'Connect L/R' to wire them via JACK.\n\n"
+            "Requires: JACK or PipeWire-JACK, jack_lsp, jack_connect."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        hlayout = QtWidgets.QHBoxLayout()
+
+        sc_group = QtWidgets.QGroupBox("SuperCollider outputs")
+        sc_layout = QtWidgets.QVBoxLayout(sc_group)
+        self.sc_list = QtWidgets.QListWidget()
+        sc_layout.addWidget(self.sc_list)
+        hlayout.addWidget(sc_group)
+
+        sys_group = QtWidgets.QGroupBox("System playback ports")
+        sys_layout = QtWidgets.QVBoxLayout(sys_group)
+        self.playback_list = QtWidgets.QListWidget()
+        sys_layout.addWidget(self.playback_list)
+        hlayout.addWidget(sys_group)
+
+        layout.addLayout(hlayout)
+
+        ctrl_layout = QtWidgets.QHBoxLayout()
+        self.refresh_button = QtWidgets.QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self._refresh_ports)
+        ctrl_layout.addWidget(self.refresh_button)
+
+        self.connect_button = QtWidgets.QPushButton("Connect L/R")
+        self.connect_button.clicked.connect(self._connect_lr)
+        ctrl_layout.addWidget(self.connect_button)
+
+        ctrl_layout.addStretch(1)
+
+        self.close_button = QtWidgets.QPushButton("Close")
+        self.close_button.clicked.connect(self.accept)
+        ctrl_layout.addWidget(self.close_button)
+
+        layout.addLayout(ctrl_layout)
+
+    def _refresh_ports(self) -> None:
+        """Reload SC and system playback port lists."""
+        self.sc_ports = list_supercollider_output_ports()
+        self.playback_ports = list_playback_ports()
+
+        self.sc_list.clear()
+        for p in self.sc_ports:
+            self.sc_list.addItem(p)
+
+        self.playback_list.clear()
+        for p in self.playback_ports:
+            self.playback_list.addItem(p)
+
+    def _connect_lr(self) -> None:
+        """Connect first two selected SC ports to first two selected playback ports."""
+        sc_sel = [item.text() for item in self.sc_list.selectedItems()]
+        pb_sel = [item.text() for item in self.playback_list.selectedItems()]
+
+        if len(sc_sel) < 2 or len(pb_sel) < 2:
+            QtWidgets.QMessageBox.warning(
                 self,
-                "Audio Reboot Error",
-                f"Failed to reboot audio engine: {exc}",
+                "Selection required",
+                "Select at least two SC outputs and two playback ports "
+                "to form a stereo L/R pair.",
             )
-
-
-
-    def _on_audio_device_combo_changed(self, index: int) -> None:
-        """When the combo selection changes, mirror the device string into the line edit."""
-        try:
-            device = self.audio_device_combo.currentData()
-        except Exception:
-            device = ""
-        if device is None:
-            device = ""
-        self.audio_device_edit.setText(str(device))
-
-
-# ------------------------------------------------------------------
-    # SuperCollider status polling
-    # ------------------------------------------------------------------
-
-    def _update_sc_status_label(self) -> None:
-        """Poll engine.get_status() and update the SuperCollider status label."""
-        try:
-            status, error = self.engine.get_status()
-        except Exception:
-            # If engine does not provide status for some reason, bail quietly.
             return
 
-        text = f"SuperCollider: {status}"
-        color = "black"
+        sc_left, sc_right = sc_sel[0], sc_sel[1]
+        pb_left, pb_right = pb_sel[0], pb_sel[1]
 
-        if status.lower().startswith("running"):
-            color = "green"
-        elif status.lower().startswith("error"):
-            color = "red"
-            if error:
-                text += f" ({error})"
-        elif "booting" in status.lower():
-            color = "orange"
-        elif "warning" in status.lower():
-            color = "darkorange"
-            if error:
-                text += f" ({error})"
+        ok_l, ok_r = connect_stereo_pair(sc_left, sc_right, pb_left, pb_right)
 
-        self.sc_status_label.setText(text)
-        self.sc_status_label.setStyleSheet(f"color: {color};")
-# ------------------------------------------------------------------
+        msg = f"Left: {'OK' if ok_l else 'FAILED'}\nRight: {'OK' if ok_r else 'FAILED'}"
+        QtWidgets.QMessageBox.information(self, "JACK connect result", msg)
+
+
+    # ------------------------------------------------------------------
     # Clean shutdown hook
     # ------------------------------------------------------------------
 
