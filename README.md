@@ -1,6 +1,4 @@
-# Peppermint Synth --- README
-
-*Roth Amplification Ltd.*
+# Peppermint Synth 
 
 ------------------------------------------------------------------------
 
